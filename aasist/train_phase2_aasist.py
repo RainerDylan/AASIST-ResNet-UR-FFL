@@ -64,12 +64,14 @@ def main():
     print(f"Loading Phase 1 Baseline Weights from {PHASE1_WEIGHTS}...")
     model.load_state_dict(torch.load(PHASE1_WEIGHTS, map_location=device))
     
-    # Section 3.7.2: Semantic Freeze Transition
-    print("Applying Semantic Freeze to AASIST Feature Extractors...")
+    # 1. STRICT SEMANTIC FREEZE (Adhering to Thesis Sec 3.7.2)
+    print("Applying Strict Semantic Freeze to AASIST Feature Extractors...")
+    frozen_modules = ['encoder', 'sinc', 'GAT_layer1', 'gat1', 'node_embedding']
     frozen_params = 0
     unfrozen_params = 0
+    
     for name, param in model.named_parameters():
-        if 'encoder' in name or 'sinc' in name or 'GAT_layer1' in name or 'gat1' in name or 'node_embedding' in name:
+        if any(fm in name for fm in frozen_modules):
             param.requires_grad = False
             frozen_params += param.numel()
         else:
@@ -82,7 +84,6 @@ def main():
     val_dataset = ASVspoofDataset(PREPROCESSED_DEV_DIR, PROTOCOL_DEV)
     sampler = create_weighted_sampler(train_dataset)
     
-    # Batch size 32 is strictly specified in Section 3.5
     train_loader = DataLoader(train_dataset, batch_size=32, sampler=sampler, num_workers=4)
     val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False, num_workers=4)
     
@@ -92,10 +93,12 @@ def main():
     actuator = DegradationActuator(device)
     
     criterion = nn.CrossEntropyLoss()
-    # Section 3.7.3.3 requires learning rate reduced to 1x10^-4
     optimizer = optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=1e-4, weight_decay=0.01)
     
     total_epochs = 50
+    # 3. PHASE 2 SCHEDULER: Ensures optimal convergence into the new minimum
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_epochs, eta_min=1e-6)
+    
     best_eer = float('inf')
     
     history_train_loss = []
@@ -117,32 +120,47 @@ def main():
             waveforms = waveforms.squeeze(1).to(device)
             labels = labels.to(device)
             
-            # 3.7.3.1 Uncertainty Measurement
-            z_u, mean_zu_sq = sensor.measure(model, waveforms)
+            # 1. SELECTOR PHASE: Measure clean vulnerability to assign degradation types
+            z_u_clean, _ = sensor.measure(model, waveforms)
+            selections = selector.select(z_u_clean)
             
-            # 3.7.3.2 Adaptive Degradation Selection
-            alpha = controller.compute_severity(mean_zu_sq)
-            epoch_severities.append(alpha)
+            # Retrieve the current alpha state from the controller
+            current_alpha = controller.alpha
+            epoch_severities.append(current_alpha)
             
-            selections = selector.select(z_u)
-            aug_waveforms = actuator.apply(waveforms, labels, selections, alpha)
+            # Apply degradations symmetrically to both classes
+            aug_waveforms = actuator.apply(waveforms, labels, selections, current_alpha)
             
-            # 3.7.3.3 The Double-Forward Training Step
+            # 2. CONTROLLER PHASE (CLOSED LOOP): Measure the model's reaction to the applied noise
+            # This is the defining requirement for a proper UR-FFL dynamic algorithm
+            _, mean_deg_uncertainty = sensor.measure(model, aug_waveforms)
+            
+            # Update the controller's internal alpha state for the NEXT batch
+            controller.compute_severity(mean_deg_uncertainty)
+            
             model.train()
+            
+            # Maintain Strict Semantic Freeze against BatchNorm Leakage
+            for name, module in model.named_modules():
+                if any(fm in name for fm in frozen_modules):
+                    module.eval()
+            
             optimizer.zero_grad()
             
+            # Double-Forward Training Step
             outputs_clean = model(waveforms)
             loss_clean = criterion(outputs_clean, labels)
             
             outputs_deg = model(aug_waveforms)
             loss_deg = criterion(outputs_deg, labels)
             
+            # Thesis Equation 15: Exact 50/50 balance
             loss_total = 0.5 * loss_clean + 0.5 * loss_deg
             loss_total.backward()
             optimizer.step()
             
             train_loss += loss_total.item()
-            pbar.set_postfix({"loss": f"{loss_total.item():.4f}", "alpha": f"{alpha:.2f}"})
+            pbar.set_postfix({"loss": f"{loss_total.item():.4f}", "alpha": f"{current_alpha:.2f}"})
             
         avg_train_loss = train_loss / len(train_loader)
         avg_severity = sum(epoch_severities) / len(epoch_severities)
@@ -176,6 +194,8 @@ def main():
         val_accuracy = 100 * correct / total
         val_eer = compute_eer(all_labels, all_probs)
         
+        scheduler.step()
+        
         history_train_loss.append(avg_train_loss)
         history_val_loss.append(avg_val_loss)
         history_val_acc.append(val_accuracy)
@@ -188,7 +208,8 @@ def main():
         eta_seconds = int(avg_epoch_time * (total_epochs - (epoch + 1)))
         eta_string = str(datetime.timedelta(seconds=eta_seconds))
         
-        print(f"End of Epoch {epoch+1} | Avg Alpha: {avg_severity:.2f} | Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f} | Val Acc: {val_accuracy:.2f}% | Val EER: {val_eer:.4f}%")
+        current_lr = optimizer.param_groups[0]['lr']
+        print(f"End of Epoch {epoch+1} | LR: {current_lr:.6f} | Avg Alpha: {avg_severity:.2f} | Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f} | Val Acc: {val_accuracy:.2f}% | Val EER: {val_eer:.4f}%")
         print(f"  -> Epoch Time: {epoch_duration:.1f}s | Estimated Time Left: {eta_string}")
         
         if val_eer < best_eer:
@@ -228,7 +249,7 @@ def main():
     plt.plot(epochs_range, history_severity, label='Avg Augmentation Severity (alpha)', color='orange')
     plt.title('UR-FFL PD Controller Actions')
     plt.xlabel('Epochs')
-    plt.ylabel('Alpha Level (0.3 to 0.9)')
+    plt.ylabel('Alpha Level (0.1 to 0.90)')
     plt.legend()
     plt.grid(True, linestyle=':', alpha=0.6)
     

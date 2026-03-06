@@ -8,16 +8,11 @@ class DegradationActuator:
     def apply(self, waveforms, labels, selections, alpha):
         aug_waveforms = waveforms.clone()
         
-        for i, (choice, label) in enumerate(zip(selections, labels)):
-            # Assuming label 1 is Bonafide
-            is_bonafide = (label.item() == 1)
-
+        for i, choice in enumerate(selections):
             if choice == 'smear':
-                if is_bonafide:
-                    aug_waveforms[i] = self._apply_smear(aug_waveforms[i], alpha)
+                aug_waveforms[i] = self._apply_smear(aug_waveforms[i], alpha)
             elif choice == 'ripple':
-                if is_bonafide:
-                    aug_waveforms[i] = self._apply_ripple(aug_waveforms[i], alpha)
+                aug_waveforms[i] = self._apply_ripple(aug_waveforms[i], alpha)
             elif choice == 'quantize':
                 aug_waveforms[i] = self._apply_quantize(aug_waveforms[i], alpha)
             elif choice == 'noise':
@@ -26,7 +21,6 @@ class DegradationActuator:
         return aug_waveforms
 
     def _apply_smear(self, waveform, alpha):
-        # Algorithm 2
         n_fft = 512
         hop_length = 256
         window = torch.hann_window(n_fft).to(self.device)
@@ -43,7 +37,6 @@ class DegradationActuator:
         return torch.istft(stft_deg, n_fft=n_fft, hop_length=hop_length, window=window, length=waveform.size(-1))
 
     def _apply_ripple(self, waveform, alpha):
-        # Algorithm 1
         n_fft = 512
         hop_length = 256
         window = torch.hann_window(n_fft).to(self.device)
@@ -63,7 +56,6 @@ class DegradationActuator:
         return torch.istft(stft_deg, n_fft=n_fft, hop_length=hop_length, window=window, length=waveform.size(-1))
 
     def _apply_quantize(self, waveform, alpha):
-        # Algorithm 3
         bits = max(8, min(16, int(16 - np.floor(alpha * 8.0))))
         levels = 2 ** bits
         
@@ -72,7 +64,6 @@ class DegradationActuator:
         return x_quant / (levels - 1)
 
     def _apply_noise(self, waveform, alpha):
-        # Algorithm 4
         max_amp = torch.max(torch.abs(waveform))
         sigma = 0.01 * alpha * max_amp
         

@@ -86,10 +86,15 @@ def main():
         weight_decay=0.01
     )
     
-    total_epochs = 80
+    # HARD EPOCH CAP FOR WARM-UP
+    total_epochs = 50
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_epochs, eta_min=1e-6)
     
     best_eer = float('inf')
+    
+    # AGGRESSIVE EARLY STOPPING (Patience = 5)
+    patience = 5 
+    epochs_no_improve = 0
     
     history_train_loss = []
     history_val_loss = []
@@ -171,12 +176,20 @@ def main():
         
         if val_eer < best_eer:
             best_eer = val_eer
+            epochs_no_improve = 0
             save_path = os.path.join(MODELS_DIR, "aasist_phase1_best.pth")
             torch.save(model.state_dict(), save_path)
-            print(f"  -> EER Improved! Saved to {save_path}")
+            print(f"  -> Phase 1 EER Improved! Saved to {save_path}")
+        else:
+            epochs_no_improve += 1
+            print(f"  -> No improvement. Early stopping counter: {epochs_no_improve}/{patience}")
+            
+        if epochs_no_improve >= patience:
+            print("\nEarly stopping triggered. Phase 1 has reached peak generalization without overfitting.")
+            break
 
     print("Phase 1 Training complete. Generating learning curve graphs...")
-    epochs_range = range(1, total_epochs + 1)
+    epochs_range = range(1, len(history_train_loss) + 1)
     
     plt.figure(figsize=(15, 5))
     

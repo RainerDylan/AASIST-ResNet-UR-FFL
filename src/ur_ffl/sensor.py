@@ -2,7 +2,6 @@ import torch
 
 class UncertaintySensor:
     def __init__(self, mc_passes=50):
-        # Section 3.5.1 mandates T=50 passes
         self.mc_passes = mc_passes
 
     def measure(self, model, waveforms):
@@ -20,20 +19,17 @@ class UncertaintySensor:
                 
             outputs = torch.cat(outputs, dim=0) 
             
-            # Eq 6: Predictive Mean
             mu = outputs.mean(dim=0)
-            # Eq 7: Predictive Variance
             sigma_sq = outputs.var(dim=0, unbiased=False)
             
-            # Eq 8: Epistemic Uncertainty
             aleatoric = mu * (1.0 - mu) + 1e-8
             u_epistemic = sigma_sq / aleatoric
             
-            # Eq 9: Z-Score Standardization
             batch_mu = u_epistemic.mean()
             batch_std = u_epistemic.std() + 1e-8
             z_u = (u_epistemic - batch_mu) / batch_std
             
-            mean_zu_sq = (z_u ** 2).mean().item()
+            # FIXED: Output the raw mean epistemic uncertainty for the PD Controller
+            mean_raw_uncertainty = batch_mu.item()
             
-        return z_u, mean_zu_sq
+        return z_u, mean_raw_uncertainty

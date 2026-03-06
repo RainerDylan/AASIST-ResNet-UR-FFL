@@ -24,3 +24,7 @@ logs/
 
 # IDE Configuration
 .vscode/
+
+# Results
+results/
+saved_models/
