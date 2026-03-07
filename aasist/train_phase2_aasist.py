@@ -30,7 +30,6 @@ from src.ur_ffl.controller import PDController
 from src.ur_ffl.selector import DegradationSelector
 from src.ur_ffl.actuator import DegradationActuator
 
-# --- YOUR ACTUAL LOCAL PATHS ---
 PREPROCESSED_TRAIN_DIR = r"D:\SAMPOERNA\Semester 8\Capstone\Dataset\ASVspoof2019_LA_train_preprocessed"
 PREPROCESSED_DEV_DIR = r"D:\SAMPOERNA\Semester 8\Capstone\Dataset\ASVspoof2019_LA_dev_preprocessed"
 PROTOCOL_TRAIN = r"D:\SAMPOERNA\Semester 8\Capstone\Dataset\2019\LA\ASVspoof2019_LA_cm_protocols\ASVspoof2019.LA.cm.train.trn.txt"
@@ -54,7 +53,7 @@ def compute_eer(y_true, y_scores):
 
 def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Initiating Phase 2 (UR-FFL) AASIST Training on {device}")
+    print(f"Initiating Phase 2 (UR-FFL) Training on {device}")
     
     model = AASIST(
         stft_window=698, stft_hop=398, freq_bins=116, gat_layers=2,
@@ -64,21 +63,23 @@ def main():
     print(f"Loading Phase 1 Baseline Weights from {PHASE1_WEIGHTS}...")
     model.load_state_dict(torch.load(PHASE1_WEIGHTS, map_location=device))
     
-    # 1. STRICT SEMANTIC FREEZE (Adhering to Thesis Sec 3.7.2)
-    print("Applying Strict Semantic Freeze to AASIST Feature Extractors...")
-    frozen_modules = ['encoder', 'sinc', 'GAT_layer1', 'gat1', 'node_embedding']
-    frozen_params = 0
-    unfrozen_params = 0
+    print("Applying Layer-Wise Learning Rate Decay (LLRD)...")
+    frontend_modules = ['encoder', 'sinc']
+    middle_modules = ['GAT_layer1', 'gat1', 'node_embedding']
+    
+    frontend_params = []
+    middle_params = []
+    backend_params = []
     
     for name, param in model.named_parameters():
-        if any(fm in name for fm in frozen_modules):
-            param.requires_grad = False
-            frozen_params += param.numel()
+        param.requires_grad = True 
+        if any(fm in name for fm in frontend_modules):
+            frontend_params.append(param)
+        elif any(mm in name for mm in middle_modules):
+            middle_params.append(param)
         else:
-            param.requires_grad = True
-            unfrozen_params += param.numel()
-    print(f"Frozen Parameters: {frozen_params} | Unfrozen Parameters: {unfrozen_params}")
-    
+            backend_params.append(param)
+            
     print("Loading datasets to memory structure...")
     train_dataset = ASVspoofDataset(PREPROCESSED_TRAIN_DIR, PROTOCOL_TRAIN)
     val_dataset = ASVspoofDataset(PREPROCESSED_DEV_DIR, PROTOCOL_DEV)
@@ -87,19 +88,25 @@ def main():
     train_loader = DataLoader(train_dataset, batch_size=32, sampler=sampler, num_workers=4)
     val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False, num_workers=4)
     
-    sensor = UncertaintySensor(mc_passes=50)
+    sensor = UncertaintySensor(mc_passes=10)
     controller = PDController()
     selector = DegradationSelector()
     actuator = DegradationActuator(device)
     
     criterion = nn.CrossEntropyLoss()
-    optimizer = optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=1e-4, weight_decay=0.01)
+    
+    optimizer = optim.AdamW([
+        {'params': frontend_params, 'lr': 1e-5}, 
+        {'params': middle_params, 'lr': 5e-5},   
+        {'params': backend_params, 'lr': 1e-4}   
+    ], weight_decay=1e-4)
     
     total_epochs = 50
-    # 3. PHASE 2 SCHEDULER: Ensures optimal convergence into the new minimum
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_epochs, eta_min=1e-6)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_epochs, eta_min=1e-7)
     
     best_eer = float('inf')
+    patience = 8
+    epochs_no_improve = 0
     
     history_train_loss = []
     history_val_loss = []
@@ -109,6 +116,8 @@ def main():
     
     total_training_time = 0.0
 
+    frozen_modules = ['encoder', 'sinc', 'GAT_layer1', 'gat1', 'node_embedding']
+
     for epoch in range(total_epochs):
         epoch_start_time = time.time()
         
@@ -116,45 +125,49 @@ def main():
         epoch_severities = []
         pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{total_epochs} [Train]")
         
+        # Initialize safe starting values for the controller
+        prev_clean_std = 0.02
+        prev_deg_std = 0.06
+        
         for waveforms, labels in pbar:
             waveforms = waveforms.squeeze(1).to(device)
             labels = labels.to(device)
             
-            # 1. SELECTOR PHASE: Measure clean vulnerability to assign degradation types
-            z_u_clean, _ = sensor.measure(model, waveforms)
+            z_u_clean, clean_std = sensor.measure(model, waveforms)
             selections = selector.select(z_u_clean)
             
-            # Retrieve the current alpha state from the controller
-            current_alpha = controller.alpha
+            current_alpha = controller.compute_severity(prev_clean_std, prev_deg_std)
             epoch_severities.append(current_alpha)
             
-            # Apply degradations symmetrically to both classes
             aug_waveforms = actuator.apply(waveforms, labels, selections, current_alpha)
             
-            # 2. CONTROLLER PHASE (CLOSED LOOP): Measure the model's reaction to the applied noise
-            # This is the defining requirement for a proper UR-FFL dynamic algorithm
-            _, mean_deg_uncertainty = sensor.measure(model, aug_waveforms)
-            
-            # Update the controller's internal alpha state for the NEXT batch
-            controller.compute_severity(mean_deg_uncertainty)
+            # Close the loop: Measure Degraded StdDev for the next batch
+            _, deg_std = sensor.measure(model, aug_waveforms)
+            prev_clean_std = clean_std
+            prev_deg_std = deg_std
             
             model.train()
             
-            # Maintain Strict Semantic Freeze against BatchNorm Leakage
+            # Maintain BatchNorm stability against leakage
             for name, module in model.named_modules():
                 if any(fm in name for fm in frozen_modules):
                     module.eval()
-            
+                    
             optimizer.zero_grad()
             
-            # Double-Forward Training Step
-            outputs_clean = model(waveforms)
-            loss_clean = criterion(outputs_clean, labels)
+            # Unified Batching guarantees clean gradient separation without corruption
+            combined_waveforms = torch.cat([waveforms, aug_waveforms], dim=0)
+            combined_labels = torch.cat([labels, labels], dim=0)
             
-            outputs_deg = model(aug_waveforms)
+            outputs = model(combined_waveforms)
+            
+            batch_size = waveforms.size(0)
+            outputs_clean = outputs[:batch_size]
+            outputs_deg = outputs[batch_size:]
+            
+            loss_clean = criterion(outputs_clean, labels)
             loss_deg = criterion(outputs_deg, labels)
             
-            # Thesis Equation 15: Exact 50/50 balance
             loss_total = 0.5 * loss_clean + 0.5 * loss_deg
             loss_total.backward()
             optimizer.step()
@@ -178,7 +191,12 @@ def main():
                 waveforms = waveforms.squeeze(1).to(device)
                 labels = labels.to(device)
                 
-                outputs = model(waveforms)
+                # Model evaluation is correctly tested on degraded audio to ensure DF generalization
+                val_z_scores = torch.zeros(waveforms.size(0)).to(device) 
+                val_selections = selector.select(val_z_scores)
+                val_aug_waveforms = actuator.apply(waveforms, labels, val_selections, alpha=0.50)
+                
+                outputs = model(val_aug_waveforms)
                 loss = criterion(outputs, labels)
                 val_loss += loss.item()
                 
@@ -208,38 +226,46 @@ def main():
         eta_seconds = int(avg_epoch_time * (total_epochs - (epoch + 1)))
         eta_string = str(datetime.timedelta(seconds=eta_seconds))
         
-        current_lr = optimizer.param_groups[0]['lr']
-        print(f"End of Epoch {epoch+1} | LR: {current_lr:.6f} | Avg Alpha: {avg_severity:.2f} | Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f} | Val Acc: {val_accuracy:.2f}% | Val EER: {val_eer:.4f}%")
+        current_lr = optimizer.param_groups[2]['lr']
+        print(f"End of Epoch {epoch+1} | Backend LR: {current_lr:.6f} | Avg Alpha: {avg_severity:.2f} | Train Loss: {avg_train_loss:.4f} | Degraded Val Loss: {avg_val_loss:.4f} | Degraded Val Acc: {val_accuracy:.2f}% | Degraded Val EER: {val_eer:.4f}%")
         print(f"  -> Epoch Time: {epoch_duration:.1f}s | Estimated Time Left: {eta_string}")
         
         if val_eer < best_eer:
             best_eer = val_eer
+            epochs_no_improve = 0
             save_path = os.path.join(MODELS_DIR, "aasist_phase2_urffl_best.pth")
             torch.save(model.state_dict(), save_path)
-            print(f"  -> UR-FFL EER Improved! Saved to {save_path}")
+            print(f"  -> UR-FFL Robust EER Improved! Saved to {save_path}")
+        else:
+            epochs_no_improve += 1
+            print(f"  -> No improvement. Early stopping counter: {epochs_no_improve}/{patience}")
+            
+        if epochs_no_improve >= patience:
+            print("\nEarly stopping triggered. Phase 2 has converged.")
+            break
 
     print("Phase 2 Training complete. Generating learning curve graphs...")
-    epochs_range = range(1, total_epochs + 1)
+    epochs_range = range(1, len(history_train_loss) + 1)
     
     plt.figure(figsize=(20, 5))
     
     plt.subplot(1, 4, 1)
     plt.plot(epochs_range, history_train_loss, label='Train Loss', color='blue')
-    plt.plot(epochs_range, history_val_loss, label='Val Loss', color='red', linestyle='dashed')
+    plt.plot(epochs_range, history_val_loss, label='Degraded Val Loss', color='red', linestyle='dashed')
     plt.title('Cross-Entropy Loss')
     plt.xlabel('Epochs')
     plt.legend()
     plt.grid(True, linestyle=':', alpha=0.6)
     
     plt.subplot(1, 4, 2)
-    plt.plot(epochs_range, history_val_acc, label='Val Accuracy (%)', color='green')
+    plt.plot(epochs_range, history_val_acc, label='Degraded Val Accuracy (%)', color='green')
     plt.title('Validation Accuracy')
     plt.xlabel('Epochs')
     plt.legend()
     plt.grid(True, linestyle=':', alpha=0.6)
     
     plt.subplot(1, 4, 3)
-    plt.plot(epochs_range, history_val_eer, label='Val EER (%)', color='purple')
+    plt.plot(epochs_range, history_val_eer, label='Degraded Val EER (%)', color='purple')
     plt.title('Equal Error Rate (EER)')
     plt.xlabel('Epochs')
     plt.legend()

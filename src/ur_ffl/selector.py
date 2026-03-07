@@ -1,9 +1,8 @@
 class DegradationSelector:
     def select(self, z_u_scores):
         selections = []
-        for zu in z_u_scores:
-            zu_val = zu.item()
-            # Table 9 Logic
+        # Safe extraction to strictly prevent PyTorch dimension crashes
+        for zu_val in z_u_scores.tolist():
             if zu_val < -1.0:
                 selections.append('smear')
             elif -1.0 <= zu_val < 0.0:

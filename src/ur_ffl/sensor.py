@@ -1,7 +1,7 @@
 import torch
 
 class UncertaintySensor:
-    def __init__(self, mc_passes=50):
+    def __init__(self, mc_passes=10):
         self.mc_passes = mc_passes
 
     def measure(self, model, waveforms):
@@ -19,17 +19,12 @@ class UncertaintySensor:
                 
             outputs = torch.cat(outputs, dim=0) 
             
-            mu = outputs.mean(dim=0)
-            sigma_sq = outputs.var(dim=0, unbiased=False)
+            # Standard Deviation is used instead of Variance to prevent Softmax crushing
+            epistemic_std = outputs.std(dim=0, unbiased=False)
             
-            aleatoric = mu * (1.0 - mu) + 1e-8
-            u_epistemic = sigma_sq / aleatoric
+            batch_mu = epistemic_std.mean()
+            batch_std_dev = epistemic_std.std() + 1e-8
             
-            batch_mu = u_epistemic.mean()
-            batch_std = u_epistemic.std() + 1e-8
-            z_u = (u_epistemic - batch_mu) / batch_std
+            z_u = (epistemic_std - batch_mu) / batch_std_dev
             
-            # FIXED: Output the raw mean epistemic uncertainty for the PD Controller
-            mean_raw_uncertainty = batch_mu.item()
-            
-        return z_u, mean_raw_uncertainty
+        return z_u, batch_mu.item()
