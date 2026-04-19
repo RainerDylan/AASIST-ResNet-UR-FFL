@@ -40,6 +40,20 @@ PROTOCOL_DF_EVAL = r"D:\SAMPOERNA\Semester 8\Capstone\Dataset\2021\ASVspoof2021_
 
 SUBSET_PROTOCOL = os.path.join(SHARED_PREPROCESSED_DIR, "subset_protocol.txt")
 
+def compute_min_dcf(fpr, fnr, p_target=0.05, c_miss=1.0, c_fa=1.0):
+    # Calculate the detection cost function across all thresholds
+    dcf = c_miss * fnr * p_target + c_fa * fpr * (1.0 - p_target)
+    
+    # Locate the minimum cost and its index
+    min_dcf = np.min(dcf)
+    min_dcf_idx = np.argmin(dcf)
+    
+    # Normalize the DCF against the default system cost
+    default_dcf = min(c_miss * p_target, c_fa * (1.0 - p_target))
+    min_dcf_norm = min_dcf / default_dcf
+    
+    return min_dcf_norm, dcf, default_dcf, min_dcf_idx
+
 def create_balanced_protocol(original_protocol, target_protocol, total_samples=10876):
     bonafide_lines = []
     spoof_lines = []
@@ -374,12 +388,15 @@ def main():
         eer_idx = np.nanargmin(np.absolute((fnr - fpr)))
         eer = fpr[eer_idx] * 100
         
+        min_dcf_norm, dcf_curve, default_dcf, min_dcf_idx = compute_min_dcf(fpr, fnr)
+        
         print("\n" + "="*40)
         print("FINAL EVALUATION METRICS")
         print("="*40)
         print(f"Average Accuracy: {accuracy:.4f}%")
         print(f"Equal Error Rate (EER): {eer:.4f}%")
         print(f"Area Under the Curve (AUC): {auc_score:.4f}")
+        print(f"Normalized Minimum DCF (t-DCF Proxy): {min_dcf_norm:.4f}")
         print("="*40)
         
         # 1. Generate ROC Curve
@@ -435,7 +452,26 @@ def main():
         plt.savefig(cm_path, dpi=300, bbox_inches='tight')
         plt.close()
         
-        print(f"4 Visual graphics successfully generated and saved to {RESULTS_DIR}")
+        # 5. Generate Detection Cost Function Curve
+        valid_idx = (thresholds >= 0.0) & (thresholds <= 1.0)
+        valid_thresholds = thresholds[valid_idx]
+        valid_dcf = (dcf_curve / default_dcf)[valid_idx]
+        
+        plt.figure(figsize=(8, 6))
+        plt.plot(valid_thresholds, valid_dcf, color='purple', lw=2, label='Normalized DCF Curve')
+        plt.plot(thresholds[min_dcf_idx], min_dcf_norm, 'ro', markersize=8, label=f'Min DCF = {min_dcf_norm:.4f}')
+        plt.xlim([0.0, 1.0])
+        plt.ylim([0.0, max(valid_dcf) * 1.1])
+        plt.xlabel('Decision Threshold')
+        plt.ylabel('Normalized Detection Cost')
+        plt.title(f'Detection Cost Function Curve ({dataset_name} Evaluation)')
+        plt.legend(loc="upper center")
+        plt.grid(True, linestyle=':', alpha=0.6)
+        dcf_path = os.path.join(RESULTS_DIR, f"eval_dcf_curve_{dataset_name.lower()}.png")
+        plt.savefig(dcf_path, dpi=300, bbox_inches='tight')
+        plt.close()
+        
+        print(f"5 Visual graphics successfully generated and saved to {RESULTS_DIR}")
 
     else:
         print("Invalid selection. Please run the script again and type 1, 2, or 3.")
