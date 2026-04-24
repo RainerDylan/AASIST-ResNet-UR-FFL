@@ -1,12 +1,12 @@
 import sys
 import os
 import random
-import shutil
 import glob
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torchaudio
+import torchaudio.transforms as T
 import numpy as np
 import matplotlib
 matplotlib.use('Agg')
@@ -16,16 +16,16 @@ from torch.utils.data import DataLoader
 from sklearn.metrics import roc_curve, auc, DetCurveDisplay, confusion_matrix, ConfusionMatrixDisplay
 
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
-ROOT_DIR = os.path.abspath(os.path.join(CURRENT_DIR, '..'))
+ROOT_DIR = os.path.abspath(os.path.join(CURRENT_DIR, '..')) if 'ensemble' in CURRENT_DIR else CURRENT_DIR
 sys.path.append(ROOT_DIR)
 
 RESULTS_DIR = os.path.join(ROOT_DIR, "results")
 MODELS_DIR = os.path.join(ROOT_DIR, "saved_models")
 os.makedirs(RESULTS_DIR, exist_ok=True)
-os.makedirs(MODELS_DIR, exist_ok=True)
 
 from src.data.dataset import ASVspoofDataset
 from src.models.aasist import AASIST
+from src.models.resnet_simam import resnet18_simam
 
 # PATH CONFIGURATION
 BASE_DATASET_DIR = r"D:\SAMPOERNA\Semester 8\Capstone\Dataset"
@@ -41,6 +41,23 @@ PROTOCOL_LA_EVAL = r"D:\SAMPOERNA\Semester 8\Capstone\Dataset\2019\LA\ASVspoof20
 RAW_DF_EVAL_DIR = r"D:\SAMPOERNA\Semester 8\Capstone\Dataset\2021\ASVspoof2021_DF_eval_part00\ASVspoof2021_DF_eval\flac"
 PROTOCOL_DF_EVAL = r"D:\SAMPOERNA\Semester 8\Capstone\Dataset\2021\ASVspoof2021_DF_eval_part00\ASVspoof2021_DF_eval\trial_metadata.txt" 
 
+class MetaLearner(nn.Module):
+    def __init__(self, input_dim=616, hidden_dim=256, num_classes=2, dropout=0.3):
+        super(MetaLearner, self).__init__()
+        self.fc1 = nn.Linear(input_dim, hidden_dim)
+        self.bn1 = nn.BatchNorm1d(hidden_dim)
+        self.relu = nn.ReLU()
+        self.dropout = nn.Dropout(dropout)
+        self.fc2 = nn.Linear(hidden_dim, num_classes)
+
+    def forward(self, emb_aasist, emb_resnet):
+        x = torch.cat([emb_aasist, emb_resnet], dim=1)
+        x = self.fc1(x)
+        x = self.bn1(x)
+        x = self.relu(x)
+        x = self.dropout(x)
+        return self.fc2(x)
+
 def compute_min_dcf(fpr, fnr, p_target=0.05, c_miss=1.0, c_fa=1.0):
     dcf = c_miss * fnr * p_target + c_fa * fpr * (1.0 - p_target)
     min_dcf = np.min(dcf)
@@ -52,30 +69,24 @@ def compute_min_dcf(fpr, fnr, p_target=0.05, c_miss=1.0, c_fa=1.0):
 def create_shuffled_protocol(original_protocol, target_protocol):
     bonafide_lines = []
     spoof_lines = []
-    
     with open(original_protocol, 'r') as f:
         for line in f:
             line_str = line.strip()
             if not line_str: 
                 continue
-                
             parts = line_str.split()
             if len(parts) < 2: 
                 continue
-                
+            
             speaker = parts[0]
             fname = parts[1]
-            
-            line_lower = line_str.lower()
-            is_bonafide = 'bonafide' in line_lower
+            is_bonafide = 'bonafide' in line_str.lower()
             label_str = 'bonafide' if is_bonafide else 'spoof'
             
-            # This strictly enforces the 5-column format required by ASVspoofDataset
             std_line = f"{speaker} {fname} - - {label_str}"
-            
-            if is_bonafide:
+            if is_bonafide: 
                 bonafide_lines.append(std_line)
-            else:
+            else: 
                 spoof_lines.append(std_line)
                 
     random.seed(42)
@@ -85,8 +96,10 @@ def create_shuffled_protocol(original_protocol, target_protocol):
     interleaved = []
     max_len = max(len(bonafide_lines), len(spoof_lines))
     for i in range(max_len):
-        if i < len(bonafide_lines): interleaved.append(bonafide_lines[i])
-        if i < len(spoof_lines): interleaved.append(spoof_lines[i])
+        if i < len(bonafide_lines): 
+            interleaved.append(bonafide_lines[i])
+        if i < len(spoof_lines): 
+            interleaved.append(spoof_lines[i])
             
     with open(target_protocol, 'w') as f:
         for line in interleaved:
@@ -110,68 +123,6 @@ def apply_preemphasis(waveform):
     alpha = 0.97
     return torch.cat([waveform[:, :1], waveform[:, 1:] - alpha * waveform[:, :-1]], dim=1)
 
-def preprocess_custom(target_dir, target_length=64600):
-    valid_extensions = ('*.wav', '*.flac', '*.mp3', '*.ogg', '*.m4a')
-    audio_files = []
-    for ext in valid_extensions:
-        audio_files.extend(glob.glob(os.path.join(RAW_CUSTOM_DIR, ext)))
-        
-    if not audio_files:
-        print(f"No custom audio files found in {RAW_CUSTOM_DIR}.")
-        return {}
-
-    file_to_chunks_map = {}
-    skipped_files = 0
-    for file_path in tqdm(audio_files, desc="Preprocessing Custom Audio"):
-        try:
-            waveform, sr = torchaudio.load(file_path)
-        except Exception:
-            skipped_files += 1
-            continue
-        
-        if sr != 16000:
-            resampler = torchaudio.transforms.Resample(orig_freq=sr, new_freq=16000)
-            waveform = resampler(waveform)
-            
-        if waveform.shape[0] > 1:
-            waveform = torch.mean(waveform, dim=0, keepdim=True)
-            
-        waveform = apply_vad_and_norm(waveform)
-        seq_len = waveform.shape[-1]
-        chunks = []
-        
-        if seq_len > (2 * target_length):
-            step = target_length 
-            for start in range(0, seq_len - target_length + 1, step):
-                chunks.append(waveform[:, start:start + target_length])
-        elif seq_len > target_length:
-            start = (seq_len - target_length) // 2
-            chunks.append(waveform[:, start:start + target_length])
-        else:
-            if seq_len <= 1:
-                chunks.append(F.pad(waveform, (0, target_length - seq_len), mode='constant', value=0))
-            else:
-                while waveform.shape[-1] < target_length:
-                    current_len = waveform.shape[-1]
-                    pad_amount = min(target_length - current_len, current_len - 1)
-                    waveform = F.pad(waveform, (0, pad_amount), mode='reflect')
-                chunks.append(waveform)
-                
-        base_name = os.path.splitext(os.path.basename(file_path))[0]
-        saved_chunks = []
-        for i, chunk in enumerate(chunks):
-            pre_emphasized = apply_preemphasis(chunk)
-            out_path = os.path.join(target_dir, f"{base_name}_chunk{i}.pt")
-            torch.save(pre_emphasized, out_path)
-            saved_chunks.append(out_path)
-            
-        file_to_chunks_map[base_name] = saved_chunks
-        
-    if skipped_files > 0:
-        print(f"\nNote: Skipped {skipped_files} corrupted custom audio files.")
-        
-    return file_to_chunks_map
-
 def build_custom_file_map_from_existing(target_dir):
     file_map = {}
     pt_files = glob.glob(os.path.join(target_dir, '*.pt'))
@@ -187,37 +138,27 @@ def preprocess_evaluation(eval_dir, protocol_file, target_dir, target_total=7000
     with open(protocol_file, 'r') as f:
         lines = f.readlines()
                 
-    if not lines:
-        print(f"No files found in protocol {protocol_file}.")
-        return
-        
     valid_lines = []
-    skipped_files = 0
     success_bonafide = 0
     success_spoof = 0
-        
     pbar = tqdm(total=target_total, desc="Preprocessing Eval Dataset")
     
     for line in lines:
-        if (success_bonafide + success_spoof) >= target_total:
+        if (success_bonafide + success_spoof) >= target_total: 
             break
-            
         parts = line.strip().split()
-        if len(parts) < 5:
+        if len(parts) < 5: 
             continue
             
         fname = parts[1]
-        label = parts[4]
-        is_bonafide = (label == 'bonafide')
-        
+        is_bonafide = (parts[4] == 'bonafide')
         file_path = os.path.join(eval_dir, f"{fname}.flac")
-        if not os.path.exists(file_path):
+        if not os.path.exists(file_path): 
             continue
             
         try:
             waveform, _ = torchaudio.load(file_path)
         except Exception:
-            skipped_files += 1
             continue
             
         waveform = apply_vad_and_norm(waveform)
@@ -236,71 +177,84 @@ def preprocess_evaluation(eval_dir, protocol_file, target_dir, target_total=7000
                     waveform = F.pad(waveform, (0, pad_amount), mode='reflect')
                     
         pre_emphasized = apply_preemphasis(waveform)
-        out_path = os.path.join(target_dir, f"{fname}.pt")
-        torch.save(pre_emphasized, out_path)
+        torch.save(pre_emphasized, os.path.join(target_dir, f"{fname}.pt"))
         valid_lines.append(line)
         
-        if is_bonafide:
+        if is_bonafide: 
             success_bonafide += 1
-        else:
+        else: 
             success_spoof += 1
-            
         pbar.update(1)
         
     pbar.close()
-        
     with open(protocol_file, 'w') as f:
-        for line in valid_lines:
+        for line in valid_lines: 
             f.write(line)
-            
-    print(f"\nPreprocessing Complete. Saved {success_bonafide} Bonafide and {success_spoof} Spoof samples.")
-    print(f"Total valid evaluation samples extracted: {success_bonafide + success_spoof}")
-    if skipped_files > 0:
-        print(f"Note: Successfully bypassed {skipped_files} corrupted FLAC files to preserve dataset integrity.")
 
-def initialize_model(device, weights_path):
-    print(f"\nLoading trained weights from {weights_path}...")
-    model = AASIST(
-        stft_window=698,
-        stft_hop=398,
-        freq_bins=116,
-        gat_layers=2,
-        heads=5,
-        head_dim=104,
-        hidden_dim=455,
-        dropout=0.3311465671378094
+def load_ensemble(device, aasist_path, resnet_path, meta_path):
+    print(f"\nLoading Frozen AASIST Base Model from {aasist_path}...")
+    aasist_model = AASIST(
+        stft_window=698, stft_hop=398, freq_bins=116, gat_layers=2, 
+        heads=5, head_dim=104, hidden_dim=455, dropout=0.3311465671378094
     ).to(device)
-    model.load_state_dict(torch.load(weights_path, map_location=device))
-    model.eval()
-    return model
+    aasist_model.load_state_dict(torch.load(aasist_path, map_location=device))
+    aasist_model.eval()
+
+    print(f"Loading Frozen ResNet-SimAM Base Model from {resnet_path}...")
+    resnet_model = resnet18_simam(num_classes=2, dropout_rate=0.22489397436884667).to(device)
+    resnet_model.load_state_dict(torch.load(resnet_path, map_location=device))
+    resnet_model.eval()
+
+    print(f"Loading Trained Meta-Learner from {meta_path}...")
+    meta_learner = MetaLearner(input_dim=616).to(device)
+    meta_learner.load_state_dict(torch.load(meta_path, map_location=device))
+    meta_learner.eval()
+
+    buffer_aasist = [None]
+    buffer_resnet = [None]
+    aasist_model.fc.register_forward_hook(lambda m, i, o: buffer_aasist.__setitem__(0, i[0]))
+    resnet_model.fc.register_forward_hook(lambda m, i, o: buffer_resnet.__setitem__(0, i[0]))
+
+    return aasist_model, resnet_model, meta_learner, buffer_aasist, buffer_resnet
 
 def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
-    pth_files = glob.glob(os.path.join(MODELS_DIR, '*aasist*.pth'))
+    pth_files = glob.glob(os.path.join(MODELS_DIR, '*meta_ensemble*.pth'))
     if not pth_files:
-        print(f"No AASIST .pth files found in {MODELS_DIR}.")
+        print(f"No Meta-Learner .pth files found in {MODELS_DIR}.")
         return
         
     print("="*40)
-    print("AVAILABLE AASIST MODELS")
+    print("AVAILABLE ENSEMBLE MODELS")
     print("="*40)
     for i, file_path in enumerate(pth_files):
         print(f"[{i+1}] {os.path.basename(file_path)}")
         
     while True:
         try:
-            model_choice = int(input("\nSelect the model to evaluate (number): ").strip())
+            model_choice = int(input("\nSelect the meta-learner to evaluate (number): ").strip())
             if 1 <= model_choice <= len(pth_files):
-                selected_weights = pth_files[model_choice - 1]
+                selected_meta_weights = pth_files[model_choice - 1]
                 break
             else:
                 print("Invalid selection. Please enter a valid number.")
         except ValueError:
             print("Invalid input. Please enter a number.")
 
+    is_urffl = 'urffl' in os.path.basename(selected_meta_weights).lower()
+    
+    if is_urffl:
+        aasist_weights = os.path.join(MODELS_DIR, "aasist_unified_best.pth")
+        resnet_weights = os.path.join(MODELS_DIR, "resnet_unified_best.pth")
+        print("\n-> UR-FFL Ensemble detected. Preparing unified base models.")
+    else:
+        aasist_weights = os.path.join(MODELS_DIR, "aasist_baseline_best.pth")
+        resnet_weights = os.path.join(MODELS_DIR, "resnet_baseline_best.pth")
+        print("\n-> Baseline Ensemble detected. Preparing baseline base models.")
+
     print("\n" + "="*40)
-    print("AASIST DYNAMIC EVALUATION SCRIPT")
+    print("META-LEARNING ENSEMBLE EVALUATION SCRIPT")
     print("="*40)
     print("[1] Custom Audio Inference (Sliding Window)")
     print("[2] Official ASVspoof 2019 LA Evaluation (Balanced Subset)")
@@ -312,27 +266,21 @@ def main():
     os.makedirs(PREPROCESSED_LA_DIR, exist_ok=True)
     os.makedirs(PREPROCESSED_DF_DIR, exist_ok=True)
 
+    aasist_model, resnet_model, meta_learner, buf_a, buf_r = load_ensemble(device, aasist_weights, resnet_weights, selected_meta_weights)
+    
+    mel_transform = T.MelSpectrogram(sample_rate=16000, n_fft=512, hop_length=160, n_mels=80).to(device)
+    amp_to_db = T.AmplitudeToDB(stype='power', top_db=80).to(device)
+
     if choice == '1':
         print("\n--- CUSTOM AUDIO MODE ---")
-        existing_custom = glob.glob(os.path.join(PREPROCESSED_CUSTOM_DIR, '*.pt'))
+        file_map = build_custom_file_map_from_existing(PREPROCESSED_CUSTOM_DIR)
         
-        if len(existing_custom) > 0:
-            print(f"Found {len(existing_custom)} preprocessed files in the custom folder.")
-            skip = input("Do you want to skip preprocessing and evaluate immediately? (Y/n): ").strip().lower()
-            if skip not in ['n', 'no']:
-                file_map = build_custom_file_map_from_existing(PREPROCESSED_CUSTOM_DIR)
-            else:
-                print(f"Clearing {PREPROCESSED_CUSTOM_DIR} for new custom data...")
-                for f in existing_custom: os.remove(f)
-                file_map = preprocess_custom(PREPROCESSED_CUSTOM_DIR)
-        else:
-            file_map = preprocess_custom(PREPROCESSED_CUSTOM_DIR)
+        if not file_map:
+            print("No custom files found. Please run individual evaluation scripts to extract first.")
+            return
             
-        if not file_map: return
-        
-        model = initialize_model(device, selected_weights)
         print("\n" + "="*40)
-        print("CUSTOM INFERENCE RESULTS")
+        print("ENSEMBLE CUSTOM INFERENCE RESULTS")
         print("="*40)
         
         with torch.no_grad():
@@ -344,10 +292,20 @@ def main():
                     chunk_tensors.append(tensor)
                     
                 batch = torch.stack(chunk_tensors)
-                outputs = model(batch)
-                probs = torch.softmax(outputs, dim=1)
                 
+                _ = aasist_model(batch)
+                emb_a = buf_a[0]
+                
+                features = amp_to_db(mel_transform(batch)).unsqueeze(1)
+                _ = resnet_model(features)
+                emb_r = buf_r[0]
+                
+                with torch.amp.autocast('cuda'):
+                    outputs = meta_learner(emb_a, emb_r)
+                    
+                probs = torch.softmax(outputs, dim=1)
                 mean_probs = torch.mean(probs, dim=0)
+                
                 deepfake_prob = mean_probs[0].item() * 100
                 bonafide_prob = mean_probs[1].item() * 100
                 
@@ -376,28 +334,15 @@ def main():
         existing_files = glob.glob(os.path.join(target_dir, '*.pt'))
         
         if len(existing_files) >= 7000 and os.path.exists(subset_protocol):
-            print(f"Found {len(existing_files)} preprocessed files in the {dataset_name} folder.")
-            skip = input("Do you want to skip preprocessing and evaluate immediately? (Y/n): ").strip().lower()
-            if skip not in ['n', 'no']:
-                print("Skipping preprocessing. Utilizing existing dataset.")
-            else:
-                print(f"Clearing folder and preprocessing robust evaluation dataset subset for {dataset_name}...")
-                for f in existing_files: os.remove(f)
-                create_shuffled_protocol(orig_protocol, subset_protocol)
-                preprocess_evaluation(raw_dir, subset_protocol, target_dir, target_total=7000)
+            print(f"Found existing evaluation dataset for {dataset_name}.")
         else:
-            if len(existing_files) > 0:
-                print(f"Found {len(existing_files)} files. We need exactly 7000. Clearing and restarting preprocessing for {dataset_name}...")
-                for f in existing_files: os.remove(f)
-            else:
-                print(f"Clearing folder and preprocessing robust evaluation dataset subset for {dataset_name}...")
-            
+            print(f"Clearing folder and preprocessing evaluation dataset subset for {dataset_name}...")
+            for f in existing_files:
+                os.remove(f)
             create_shuffled_protocol(orig_protocol, subset_protocol)
             preprocess_evaluation(raw_dir, subset_protocol, target_dir, target_total=7000)
             
-        model = initialize_model(device, selected_weights)
-        print("Loading official protocol and preprocessed tensors...")
-        
+        print("Executing Meta-Learner Inference Engine...")
         eval_dataset = ASVspoofDataset(target_dir, subset_protocol)
         eval_loader = DataLoader(eval_dataset, batch_size=64, shuffle=False, num_workers=4)
         
@@ -411,10 +356,20 @@ def main():
             for waveforms, labels in tqdm(eval_loader, desc="Evaluating Benchmarks"):
                 waveforms = waveforms.squeeze(1).to(device)
                 labels = labels.to(device)
-                outputs = model(waveforms)
-                probs = torch.softmax(outputs, dim=1)[:, 1]
                 
+                _ = aasist_model(waveforms)
+                emb_a = buf_a[0]
+                
+                features = amp_to_db(mel_transform(waveforms)).unsqueeze(1)
+                _ = resnet_model(features)
+                emb_r = buf_r[0]
+                
+                with torch.amp.autocast('cuda'):
+                    outputs = meta_learner(emb_a, emb_r)
+                    
+                probs = torch.softmax(outputs, dim=1)[:, 1]
                 _, predicted_classes = torch.max(outputs.data, 1)
+                
                 total_samples += labels.size(0)
                 correct_predictions += (predicted_classes == labels).sum().item()
                 
@@ -446,7 +401,7 @@ def main():
         bonafide_scores = all_probs[all_labels == 1]
         
         print("\n" + "="*40)
-        print("EXTENDED AI DIAGNOSTIC REPORT")
+        print("ENSEMBLE AI DIAGNOSTIC REPORT")
         print("="*40)
         print("--- CONFUSION MATRIX ---")
         print(f"True Positives (Correct Spoof):  {tp}")
@@ -458,17 +413,9 @@ def main():
         print("\n--- SCORE DISTRIBUTION ---")
         print("Bonafide (Class 1) Probabilities:")
         print(f"  Mean: {np.mean(bonafide_scores):.4f} | Std: {np.std(bonafide_scores):.4f}")
-        print(f"  Min:  {np.min(bonafide_scores):.4f} | Max: {np.max(bonafide_scores):.4f}")
         print("Deepfake (Class 0) Probabilities:")
         print(f"  Mean: {np.mean(deepfake_scores):.4f} | Std: {np.std(deepfake_scores):.4f}")
-        print(f"  Min:  {np.min(deepfake_scores):.4f} | Max: {np.max(deepfake_scores):.4f}")
         
-        print("\n--- ROC & THRESHOLD ANALYSIS ---")
-        fpr_targets = [0.01, 0.05, 0.10]
-        for t_fpr in fpr_targets:
-            idx = np.argmin(np.abs(fpr - t_fpr))
-            print(f"TPR @ FPR={t_fpr*100:.0f}%: {tpr[idx]*100:.2f}% (Threshold: {thresholds[idx]:.4f})")
-            
         print("\n--- DETECTION COST FUNCTION (DCF) ---")
         print(f"Min Normalized DCF: {min_dcf_norm:.4f} at Decision Threshold: {thresholds[min_dcf_idx]:.4f}")
         
@@ -488,41 +435,39 @@ def main():
         plt.ylim([0.0, 1.05])
         plt.xlabel('False Positive Rate (FAR)')
         plt.ylabel('True Positive Rate (TPR)')
-        plt.title(f'ROC Curve ({dataset_name} Evaluation)')
+        plt.title(f'ROC Curve (Ensemble {dataset_name} Evaluation)')
         plt.legend(loc="lower right")
         plt.grid(True, linestyle=':', alpha=0.6)
-        roc_path = os.path.join(RESULTS_DIR, f"eval_roc_curve_{dataset_name.lower()}.png")
+        roc_path = os.path.join(RESULTS_DIR, f"eval_ensemble_roc_curve_{dataset_name.lower()}.png")
         plt.savefig(roc_path, dpi=300, bbox_inches='tight')
         plt.close()
         
         fig, ax = plt.subplots(figsize=(8, 6))
-        display = DetCurveDisplay(fpr=fpr, fnr=fnr, estimator_name='AASIST Model')
+        display = DetCurveDisplay(fpr=fpr, fnr=fnr, estimator_name='Meta-Ensemble')
         display.plot(ax=ax)
-        plt.title(f'DET Curve ({dataset_name} Evaluation)')
+        plt.title(f'DET Curve (Ensemble {dataset_name} Evaluation)')
         plt.grid(True, linestyle=':', alpha=0.6)
-        det_path = os.path.join(RESULTS_DIR, f"eval_det_curve_{dataset_name.lower()}.png")
+        det_path = os.path.join(RESULTS_DIR, f"eval_ensemble_det_curve_{dataset_name.lower()}.png")
         plt.savefig(det_path, dpi=300, bbox_inches='tight')
         plt.close()
         
         plt.figure(figsize=(8, 6))
         plt.hist(bonafide_scores, bins=50, alpha=0.6, color='#2ca02c', label='Bonafide (True Class)', edgecolor='white', linewidth=0.5)
         plt.hist(deepfake_scores, bins=50, alpha=0.6, color='#d62728', label='Deepfake (Spoof Class)', edgecolor='white', linewidth=0.5)
-        plt.title(f'Model Confidence Score Distribution ({dataset_name} Evaluation)', fontsize=12, pad=15)
+        plt.title(f'Ensemble Confidence Score Distribution ({dataset_name})', fontsize=12, pad=15)
         plt.xlabel('Predicted Probability of being Bonafide', fontsize=10)
         plt.ylabel('Number of Audio Samples', fontsize=10)
         plt.legend(loc="upper center")
         plt.grid(True, linestyle=':', alpha=0.6)
-        dist_path = os.path.join(RESULTS_DIR, f"eval_score_dist_{dataset_name.lower()}.png")
+        dist_path = os.path.join(RESULTS_DIR, f"eval_ensemble_score_dist_{dataset_name.lower()}.png")
         plt.savefig(dist_path, dpi=300, bbox_inches='tight')
         plt.close()
 
         fig, ax = plt.subplots(figsize=(7, 6))
         cm_display = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=['Deepfake', 'Bonafide'])
         cm_display.plot(cmap=plt.cm.Blues, ax=ax, values_format='d')
-        plt.title(f'Confusion Matrix ({dataset_name} Evaluation)', fontsize=12, pad=15)
-        plt.xlabel('Predicted Classification', fontsize=10)
-        plt.ylabel('True Ground Label', fontsize=10)
-        cm_path = os.path.join(RESULTS_DIR, f"eval_confusion_matrix_{dataset_name.lower()}.png")
+        plt.title(f'Confusion Matrix (Ensemble {dataset_name})', fontsize=12, pad=15)
+        cm_path = os.path.join(RESULTS_DIR, f"eval_ensemble_confusion_matrix_{dataset_name.lower()}.png")
         plt.savefig(cm_path, dpi=300, bbox_inches='tight')
         plt.close()
         
@@ -537,17 +482,14 @@ def main():
         plt.ylim([0.0, max(valid_dcf) * 1.1])
         plt.xlabel('Decision Threshold')
         plt.ylabel('Normalized Detection Cost')
-        plt.title(f'Detection Cost Function Curve ({dataset_name} Evaluation)')
+        plt.title(f'Detection Cost Function Curve (Ensemble {dataset_name})')
         plt.legend(loc="upper center")
         plt.grid(True, linestyle=':', alpha=0.6)
-        dcf_path = os.path.join(RESULTS_DIR, f"eval_dcf_curve_{dataset_name.lower()}.png")
+        dcf_path = os.path.join(RESULTS_DIR, f"eval_ensemble_dcf_curve_{dataset_name.lower()}.png")
         plt.savefig(dcf_path, dpi=300, bbox_inches='tight')
         plt.close()
         
-        print(f"5 Visual graphics successfully generated and saved to {RESULTS_DIR}")
-
-    else:
-        print("Invalid selection. Please run the script again and type 1, 2, or 3.")
+        print(f"5 Ensemble graphics successfully generated and saved to {RESULTS_DIR}")
 
 if __name__ == "__main__":
     main()

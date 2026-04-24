@@ -7,6 +7,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torchaudio
+import torchaudio.transforms as T
 import numpy as np
 import matplotlib
 matplotlib.use('Agg')
@@ -25,7 +26,7 @@ os.makedirs(RESULTS_DIR, exist_ok=True)
 os.makedirs(MODELS_DIR, exist_ok=True)
 
 from src.data.dataset import ASVspoofDataset
-from src.models.aasist import AASIST
+from src.models.resnet_simam import resnet18_simam
 
 # PATH CONFIGURATION
 BASE_DATASET_DIR = r"D:\SAMPOERNA\Semester 8\Capstone\Dataset"
@@ -260,16 +261,13 @@ def preprocess_evaluation(eval_dir, protocol_file, target_dir, target_total=7000
 
 def initialize_model(device, weights_path):
     print(f"\nLoading trained weights from {weights_path}...")
-    model = AASIST(
-        stft_window=698,
-        stft_hop=398,
-        freq_bins=116,
-        gat_layers=2,
-        heads=5,
-        head_dim=104,
-        hidden_dim=455,
-        dropout=0.3311465671378094
+    
+    # Initialize ResNet with optimal hyperparameters from tuning
+    model = resnet18_simam(
+        num_classes=2, 
+        dropout_rate=0.22489397436884667
     ).to(device)
+    
     model.load_state_dict(torch.load(weights_path, map_location=device))
     model.eval()
     return model
@@ -277,13 +275,18 @@ def initialize_model(device, weights_path):
 def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
-    pth_files = glob.glob(os.path.join(MODELS_DIR, '*aasist*.pth'))
+    # Feature Extraction initializations
+    mel_transform = T.MelSpectrogram(sample_rate=16000, n_fft=512, hop_length=160, n_mels=80).to(device)
+    amp_to_db = T.AmplitudeToDB(stype='power', top_db=80).to(device)
+    
+    # Look specifically for ResNet weights
+    pth_files = glob.glob(os.path.join(MODELS_DIR, '*resnet*.pth'))
     if not pth_files:
-        print(f"No AASIST .pth files found in {MODELS_DIR}.")
+        print(f"No ResNet .pth files found in {MODELS_DIR}.")
         return
         
     print("="*40)
-    print("AVAILABLE AASIST MODELS")
+    print("AVAILABLE RESNET-SIMAM MODELS")
     print("="*40)
     for i, file_path in enumerate(pth_files):
         print(f"[{i+1}] {os.path.basename(file_path)}")
@@ -300,7 +303,7 @@ def main():
             print("Invalid input. Please enter a number.")
 
     print("\n" + "="*40)
-    print("AASIST DYNAMIC EVALUATION SCRIPT")
+    print("RESNET DYNAMIC EVALUATION SCRIPT")
     print("="*40)
     print("[1] Custom Audio Inference (Sliding Window)")
     print("[2] Official ASVspoof 2019 LA Evaluation (Balanced Subset)")
@@ -344,7 +347,14 @@ def main():
                     chunk_tensors.append(tensor)
                     
                 batch = torch.stack(chunk_tensors)
-                outputs = model(batch)
+                
+                # Spectral transformation for ResNet
+                mel_spec = mel_transform(batch)
+                features = amp_to_db(mel_spec).unsqueeze(1)
+                
+                with torch.amp.autocast('cuda'):
+                    outputs = model(features)
+                    
                 probs = torch.softmax(outputs, dim=1)
                 
                 mean_probs = torch.mean(probs, dim=0)
@@ -411,7 +421,14 @@ def main():
             for waveforms, labels in tqdm(eval_loader, desc="Evaluating Benchmarks"):
                 waveforms = waveforms.squeeze(1).to(device)
                 labels = labels.to(device)
-                outputs = model(waveforms)
+                
+                # Spectral transformation for ResNet
+                mel_spec = mel_transform(waveforms)
+                features = amp_to_db(mel_spec).unsqueeze(1)
+                
+                with torch.amp.autocast('cuda'):
+                    outputs = model(features)
+                    
                 probs = torch.softmax(outputs, dim=1)[:, 1]
                 
                 _, predicted_classes = torch.max(outputs.data, 1)
@@ -491,16 +508,16 @@ def main():
         plt.title(f'ROC Curve ({dataset_name} Evaluation)')
         plt.legend(loc="lower right")
         plt.grid(True, linestyle=':', alpha=0.6)
-        roc_path = os.path.join(RESULTS_DIR, f"eval_roc_curve_{dataset_name.lower()}.png")
+        roc_path = os.path.join(RESULTS_DIR, f"eval_resnet_roc_curve_{dataset_name.lower()}.png")
         plt.savefig(roc_path, dpi=300, bbox_inches='tight')
         plt.close()
         
         fig, ax = plt.subplots(figsize=(8, 6))
-        display = DetCurveDisplay(fpr=fpr, fnr=fnr, estimator_name='AASIST Model')
+        display = DetCurveDisplay(fpr=fpr, fnr=fnr, estimator_name='ResNet-SimAM Model')
         display.plot(ax=ax)
         plt.title(f'DET Curve ({dataset_name} Evaluation)')
         plt.grid(True, linestyle=':', alpha=0.6)
-        det_path = os.path.join(RESULTS_DIR, f"eval_det_curve_{dataset_name.lower()}.png")
+        det_path = os.path.join(RESULTS_DIR, f"eval_resnet_det_curve_{dataset_name.lower()}.png")
         plt.savefig(det_path, dpi=300, bbox_inches='tight')
         plt.close()
         
@@ -512,7 +529,7 @@ def main():
         plt.ylabel('Number of Audio Samples', fontsize=10)
         plt.legend(loc="upper center")
         plt.grid(True, linestyle=':', alpha=0.6)
-        dist_path = os.path.join(RESULTS_DIR, f"eval_score_dist_{dataset_name.lower()}.png")
+        dist_path = os.path.join(RESULTS_DIR, f"eval_resnet_score_dist_{dataset_name.lower()}.png")
         plt.savefig(dist_path, dpi=300, bbox_inches='tight')
         plt.close()
 
@@ -522,7 +539,7 @@ def main():
         plt.title(f'Confusion Matrix ({dataset_name} Evaluation)', fontsize=12, pad=15)
         plt.xlabel('Predicted Classification', fontsize=10)
         plt.ylabel('True Ground Label', fontsize=10)
-        cm_path = os.path.join(RESULTS_DIR, f"eval_confusion_matrix_{dataset_name.lower()}.png")
+        cm_path = os.path.join(RESULTS_DIR, f"eval_resnet_confusion_matrix_{dataset_name.lower()}.png")
         plt.savefig(cm_path, dpi=300, bbox_inches='tight')
         plt.close()
         
@@ -540,7 +557,7 @@ def main():
         plt.title(f'Detection Cost Function Curve ({dataset_name} Evaluation)')
         plt.legend(loc="upper center")
         plt.grid(True, linestyle=':', alpha=0.6)
-        dcf_path = os.path.join(RESULTS_DIR, f"eval_dcf_curve_{dataset_name.lower()}.png")
+        dcf_path = os.path.join(RESULTS_DIR, f"eval_resnet_dcf_curve_{dataset_name.lower()}.png")
         plt.savefig(dcf_path, dpi=300, bbox_inches='tight')
         plt.close()
         
