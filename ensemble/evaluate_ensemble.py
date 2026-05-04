@@ -62,13 +62,29 @@ class MetaLearner(nn.Module):
 class CrossAttentionFuser(nn.Module):
     def __init__(self, dim_a=104, dim_r=512, embed_dim=256, num_heads=8, num_classes=2, dropout=0.3):
         super().__init__()
-        self.proj_a = nn.Linear(dim_a, embed_dim)
-        self.proj_r = nn.Linear(dim_r, embed_dim)
+        self.proj_a = nn.Sequential(nn.Linear(dim_a, embed_dim), nn.LayerNorm(embed_dim))
+        self.proj_r = nn.Sequential(nn.Linear(dim_r, embed_dim), nn.LayerNorm(embed_dim))
+        
         self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
         nn.init.normal_(self.cls_token, std=0.02)
-        encoder_layer = nn.TransformerEncoderLayer(d_model=embed_dim, nhead=num_heads, dropout=dropout, batch_first=True)
+        
+        # FIX: Added dim_feedforward=1024 to match training script
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=embed_dim, 
+            nhead=num_heads, 
+            dim_feedforward=1024, 
+            dropout=dropout, 
+            batch_first=True
+        )
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=2)
-        self.fc = nn.Sequential(nn.Linear(embed_dim, embed_dim), nn.ReLU(), nn.Dropout(dropout), nn.Linear(embed_dim, num_classes))
+        
+        # FIX: Renamed 'fc' to 'head' to match training script
+        self.head = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(embed_dim, num_classes)
+        )
 
     def forward(self, emb_a, emb_r):
         if emb_a.dtype != emb_r.dtype: emb_a = emb_a.to(emb_r.dtype)
@@ -78,14 +94,14 @@ class CrossAttentionFuser(nn.Module):
         cls_tokens = self.cls_token.expand(B, -1, -1) 
         x = torch.cat((cls_tokens, feat_a, feat_r), dim=1) 
         x = self.transformer(x)
-        return self.fc(x[:, 0, :])
+        # Output uses self.head
+        return self.head(x[:, 0, :])
 
 class EndToEndEnsemble(nn.Module):
     def __init__(self, aasist, resnet, fusion_head):
         super(EndToEndEnsemble, self).__init__()
         self.aasist = aasist
         self.resnet = resnet
-        # Using generic name 'fusion_head' but mapping it dynamically for state dicts
         self.fusion_head = fusion_head
         self.emb_a = [None]
         self.emb_r = [None]
@@ -217,7 +233,6 @@ def load_ensemble(device, selected_weights_path):
     aasist_model = AASIST(stft_window=698, stft_hop=398, freq_bins=116, gat_layers=2, heads=5, head_dim=104, hidden_dim=455, dropout=0.33).to(device)
     resnet_model = resnet18_simam(num_classes=2, dropout_rate=0.22).to(device)
     
-    # Auto-detect architecture type
     is_cross_attention = "crossattention" in os.path.basename(selected_weights_path).lower()
     
     if is_cross_attention:
@@ -229,8 +244,16 @@ def load_ensemble(device, selected_weights_path):
     
     wrapper = EndToEndEnsemble(aasist_model, resnet_model, fusion_head).to(device)
     
-    # If loading old MLP weights, map fusion_head to meta_learner locally to prevent dict errors
-    state_dict = torch.load(selected_weights_path, map_location=device)
+    # Load the saved file (either raw weights or a full checkpoint dictionary)
+    checkpoint = torch.load(selected_weights_path, map_location=device)
+    
+    # Safely extract the raw weights if it's a full UR-FFL checkpoint dictionary
+    if 'model_state_dict' in checkpoint:
+        state_dict = checkpoint['model_state_dict']
+    else:
+        state_dict = checkpoint
+
+    # Apply the weights to the model
     if not is_cross_attention:
         new_state_dict = {}
         for k, v in state_dict.items():
