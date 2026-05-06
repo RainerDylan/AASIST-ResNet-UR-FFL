@@ -424,7 +424,7 @@ def main():
     plt.title(f'ROC Curve ({dataset_name} Evaluation)')
     plt.legend(loc="lower right")
     plt.grid(True, linestyle=':', alpha=0.6)
-    roc_path = os.path.join(RESULTS_DIR, f"eval_roc_curve_{dataset_name.lower()}.png")
+    roc_path = os.path.join(RESULTS_DIR, f"meta_roc_curve_{dataset_name.lower()}.png")
     plt.savefig(roc_path, dpi=300, bbox_inches='tight')
     plt.close()
     
@@ -432,7 +432,7 @@ def main():
     cm_display = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=['Deepfake', 'Bonafide'])
     cm_display.plot(cmap=plt.cm.Blues, ax=ax, values_format='d')
     plt.title(f'Confusion Matrix ({dataset_name})', fontsize=12, pad=15)
-    cm_path = os.path.join(RESULTS_DIR, f"eval_confusion_matrix_{dataset_name.lower()}.png")
+    cm_path = os.path.join(RESULTS_DIR, f"meta_confusion_matrix_{dataset_name.lower()}.png")
     plt.savefig(cm_path, dpi=300, bbox_inches='tight')
     plt.close()
     

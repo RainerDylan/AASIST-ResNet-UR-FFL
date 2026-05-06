@@ -48,7 +48,7 @@ class UncertaintySensor:
     sample's inherent difficulty before augmentation is applied.
     """
 
-    def __init__(self, mc_passes: int = 10):
+    def __init__(self, mc_passes: int = 50):
         """
         Parameters
         ----------

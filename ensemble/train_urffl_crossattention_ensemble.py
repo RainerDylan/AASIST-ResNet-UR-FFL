@@ -1,5 +1,3 @@
-
-
 import sys
 import os
 import time
@@ -10,16 +8,17 @@ import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
 import torchaudio.transforms as T
-from torch.utils.data import DataLoader, WeightedRandomSampler
+from torch.utils.data import DataLoader, WeightedRandomSampler, SubsetRandomSampler
 from tqdm import tqdm
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from sklearn.metrics import roc_curve, roc_auc_score
+from scipy.interpolate import interp1d
+from scipy.optimize import brentq
 
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
-ROOT_DIR = (os.path.abspath(os.path.join(CURRENT_DIR, ".."))
-            if "ensemble" in CURRENT_DIR else CURRENT_DIR)
+ROOT_DIR    = os.path.abspath(os.path.join(CURRENT_DIR, "..")) if "ensemble" in CURRENT_DIR else CURRENT_DIR
 sys.path.append(ROOT_DIR)
 
 RESULTS_DIR = os.path.join(ROOT_DIR, "results")
@@ -39,791 +38,620 @@ PREPROCESSED_TRAIN_DIR = r"D:\SAMPOERNA\Semester 8\Capstone\Dataset\ASVspoof2019
 PREPROCESSED_DEV_DIR   = r"D:\SAMPOERNA\Semester 8\Capstone\Dataset\ASVspoof2019_LA_dev_preprocessed"
 PROTOCOL_TRAIN = r"D:\SAMPOERNA\Semester 8\Capstone\Dataset\2019\LA\ASVspoof2019_LA_cm_protocols\ASVspoof2019.LA.cm.train.trn.txt"
 PROTOCOL_DEV   = r"D:\SAMPOERNA\Semester 8\Capstone\Dataset\2019\LA\ASVspoof2019_LA_cm_protocols\ASVspoof2019.LA.cm.dev.trl.txt"
-OUTPUT_WEIGHTS = os.path.join(MODELS_DIR, "crossattention_ensemble_urffl_best.pth")
 
-# ── Shared hyperparameters (identical to baseline v3) ─────────────────────────
-TOTAL_EPOCHS    = 100
-BATCH_SIZE      = 16
-LR              = 1e-4
-WEIGHT_DECAY    = 3e-4    # FIX 2: was 1e-4 hard-coded in AdamW
-WARMUP_EPOCHS   = 5
-PATIENCE        = 25
+OUTPUT_WEIGHTS       = os.path.join(MODELS_DIR, "crossattention_ensemble_urffl_best.pth")
+OUTPUT_WEIGHTS_CLEAN = os.path.join(MODELS_DIR, "crossattention_ensemble_urffl_best_clean.pth")
 
-# ── SpecAugment config (identical to baseline v3) ─────────────────────────────
-FREQ_MASK_PARAM = 15
-TIME_MASK_PARAM = 25
+# ── Hyperparameters ───────────────────────────────────────────────────────────
+TOTAL_EPOCHS  = 100
+BATCH_SIZE    = 16
 
-# ── Phased training boundary (identical to baseline v3) ───────────────────────
-PHASE1_END   = 20         # epochs 0..(PHASE1_END-1) are Phase 1
+# FIX [F5]: Fuser LR corrected to lead the backbone (was inverted: 5e-5 < 5e-4)
+# Baseline ratio: LR_FUSER / LR_BASE ≈ 2–5× → fuser adapts faster than backbone
+LR_BASE   = 3e-4   # AASIST + ResNet
+LR_FUSER  = 5e-4   # CrossAttentionFuser
 
-# ── UR-FFL: phased loss weights (FIX 5) ───────────────────────────────────────
-# Phase 1 — base models first (AUX dominates):
-P1_CLEAN_W = 0.10   # fusion loss on clean batch
-P1_DEG_W   = 0.10   # fusion loss on aug batch
-P1_AUX_W   = 0.70   # base-model auxiliary loss  (0.35 per base model)
-P1_CONS_W  = 0.10   # π-model consistency
-# Phase 2 — fusion focus (meta dominates):
-P2_CLEAN_W = 0.30
-P2_DEG_W   = 0.30
-P2_AUX_W   = 0.30   # base-model auxiliary loss  (0.15 per base model)
-P2_CONS_W  = 0.10
+WEIGHT_DECAY  = 3e-4
+WARMUP_EPOCHS = 5
+PATIENCE      = 20
 
-# ── UR-FFL: PD controller phase behaviour (FIX 6) ─────────────────────────────
-PHASE1_ALPHA = 0.20   # fixed augmentation intensity during Phase 1
+# UR-FFL training loss weights (unchanged from methodology)
+CLEAN_W = 0.35
+DEG_W   = 0.35
+AUX_W   = 0.20   # 0.10 per base model
+CONS_W  = 0.10
 
-# ── Composite checkpoint metric weights ───────────────────────────────────────
-CKPT_CLEAN_W = 0.30
-CKPT_AUG_W   = 0.70
+# FIX [F3]: Rebalanced checkpoint metric.
+# Root cause of DF regression: CKPT_AUG_W=0.70 caused checkpoint selection to
+# purely optimise for augmented EER once EER_clean≈0.  Best ep~50 for DF was
+# the epoch before aug-overfitting completed.  Fix: give clean EER 65% weight
+# so the best checkpoint is selected for real-world generalisation.
+CKPT_CLEAN_W = 0.65
+CKPT_AUG_W   = 0.35
 
 
-def get_phase_weights(epoch: int):
-    """Return (clean_w, deg_w, aux_w, cons_w) for the current epoch."""
-    if epoch < PHASE1_END:
-        return P1_CLEAN_W, P1_DEG_W, P1_AUX_W, P1_CONS_W
-    return P2_CLEAN_W, P2_DEG_W, P2_AUX_W, P2_CONS_W
+# ── PD Controller ─────────────────────────────────────────────────────────────
+# FIX [F1]: Re-calibrated PD controller so it provides genuine feedback.
+#
+# ROOT CAUSE of alpha ramp-scheduler behaviour:
+#   Old SETPOINT=8pp was unreachable — the empirical clean-vs-aug confidence gap
+#   settles at ~1-3pp once the model converges.  With error always positive the
+#   PD integral never reverses, making alpha a monotone ramp to alpha_max=0.75.
+#
+# NEW parameters:
+#   SETPOINT=3.0pp  — sits inside the achievable range [0, ~5pp], creating true
+#                      bidirectional feedback (gap>3 → increase α, gap<3 → decrease)
+#   alpha_max=0.55  — prevents the "aug-cliff" where SNR is too low to carry
+#                      phonological structure, destroying DF generalisation
+#   MAX_STEP=0.015  — halved from 0.03; prevents aggressive α jumps that caused
+#                      the val-loss spikes at ep 25-27 when α first hit 0.75
+#   Kp=0.005, Kd=0.002 — slightly reduced proportional gain for smoother curves
 
+class _PDController:
+    SETPOINT  = 3.0     # pp  [was 8.0]
+    MAX_STEP  = 0.015   # per epoch cap  [was 0.03]
+    EMA_BETA  = 0.35
+    SAT_THRESH = 5
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Revised PD Controller (inlined — FIX 6)
-# ══════════════════════════════════════════════════════════════════════════════
+    def __init__(self):
+        self.Kp        = 0.005; self.Kd        = 0.002
+        self.alpha_min = 0.0;   self.alpha_max = 0.55   # [was 0.75]
+        self.alpha     = 0.0
+        self.setpoint  = self.SETPOINT
+        self._sp_min   = 2.0;   self._sp_max   = 6.0
+        self._ema      = 0.0;   self._prev_err = 0.0
+        self._warmup   = True;  self._sat_hi   = 0;  self._sat_lo = 0
 
-class PDController:
-    """
-    Proportional-Derivative controller for UR-FFL augmentation intensity α.
-
-    Control Law (discrete, anti-windup)
-    ─────────────────────────────────────
-        error[k]   = setpoint − gap[k]
-        d_error[k] = error[k] − error[k−1]
-        delta      = Kp·error[k] + Kd·d_error[k]
-        α[k]       = clamp(α[k−1] − delta, α_min, α_max)
-
-    Sign Convention
-    ───────────────
-        gap > setpoint → error < 0 → delta < 0 → α increases
-            (clean model more confident than aug → harder augmentation)
-        gap < setpoint → error > 0 → delta > 0 → α decreases
-            (augmentation already challenging → ease off)
-
-    Phase Behaviour (FIX 6)
-    ───────────────────────
-    During Phase 1 (epochs 0..PHASE1_END-1), the PD controller is NOT
-    called. Instead, alpha is held at PHASE1_ALPHA=0.20. At the phase
-    boundary, alpha and _prev_error are reset so Phase 2 starts cleanly.
-
-    Anti-Windup
-    ───────────
-    α is clamped at every step. No external clamping needed.
-    """
-
-    def __init__(
-        self,
-        setpoint:   float = 10.0,
-        Kp:         float = 0.015,
-        Kd:         float = 0.005,
-        alpha_min:  float = 0.10,
-        alpha_max:  float = 0.90,
-        alpha_init: float = 0.20,
-    ):
-        self.setpoint    = setpoint
-        self.Kp          = Kp
-        self.Kd          = Kd
-        self.alpha_min   = alpha_min
-        self.alpha_max   = alpha_max
-        self.alpha       = alpha_init
-        self._prev_error = 0.0
-
-    def reset(self, alpha: float) -> None:
-        """Reset controller state at the Phase 1→2 boundary."""
-        self.alpha       = alpha
-        self._prev_error = 0.0
+    def reset(self):
+        self.alpha    = 0.0; self.setpoint = self.SETPOINT
+        self._ema     = 0.0; self._prev_err = 0.0
+        self._warmup  = True; self._sat_hi  = 0; self._sat_lo = 0
 
     def update(self, gap: float) -> float:
-        """
-        Update α given the current epoch-mean accuracy gap (pp).
-        Call only during Phase 2.
-        """
-        error   = self.setpoint - gap
-        d_error = error - self._prev_error
-        delta   = self.Kp * error + self.Kd * d_error
-        new_alpha = self.alpha - delta
-        new_alpha = float(np.clip(new_alpha, self.alpha_min, self.alpha_max))
-        self._prev_error = error
-        self.alpha       = new_alpha
-        return new_alpha
+        if self._warmup:
+            self._ema     = gap; self._warmup = False
+            print(f"  [PD] Warmup: EMA={gap:.1f}pp  SP={self.setpoint:.1f}pp  α={self.alpha:.4f}")
+            return self.alpha
+
+        self._ema = self.EMA_BETA * self._ema + (1. - self.EMA_BETA) * gap
+        err       = self._ema - self.setpoint
+        delta     = float(np.clip(self.Kp * err + self.Kd * (err - self._prev_err),
+                                  -self.MAX_STEP, self.MAX_STEP))
+
+        at_max = self.alpha >= self.alpha_max - 1e-4
+        at_min = self.alpha <= self.alpha_min + 1e-4
+
+        if at_max:
+            self._sat_hi += 1; self._sat_lo = 0
+            if delta < 0: delta = 0.
+            if self._sat_hi >= self.SAT_THRESH:
+                old = self.setpoint
+                self.setpoint = min(self.setpoint + 0.5, self._sp_max)
+                self._sat_hi  = 0
+                if self.setpoint != old:
+                    print(f"  [PD] Anti-windup↑: SP {old:.1f}→{self.setpoint:.1f}pp")
+        elif at_min:
+            self._sat_lo += 1; self._sat_hi = 0
+            if delta > 0: delta = 0.
+            if self._sat_lo >= self.SAT_THRESH:
+                old = self.setpoint
+                self.setpoint = max(self.setpoint - 0.5, self._sp_min)
+                self._sat_lo  = 0
+                if self.setpoint != old:
+                    print(f"  [PD] Anti-windup↓: SP {old:.1f}→{self.setpoint:.1f}pp")
+        else:
+            self._sat_hi = 0; self._sat_lo = 0
+
+        prev       = self.alpha
+        self.alpha = float(np.clip(self.alpha - delta, self.alpha_min, self.alpha_max))
+        self._prev_err = err
+        d = "↑" if self.alpha > prev + 1e-4 else ("↓" if self.alpha < prev - 1e-4 else "–")
+        print(f"  [PD] gap={gap:.1f}pp EMA={self._ema:.1f}pp SP={self.setpoint:.1f}pp "
+              f"err={err:+.2f} δ={-delta:+.4f} α={self.alpha:.4f}{d}")
+        return self.alpha
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Loss Function (FIX 1: label_smoothing=0.10, identical to baseline v3)
-# ══════════════════════════════════════════════════════════════════════════════
-
+# ── Loss ──────────────────────────────────────────────────────────────────────
 class FocalLoss(nn.Module):
-    """
-    Focal Loss (Lin et al. ICCV 2017) with label smoothing.
-    FIX 1: label_smoothing raised from 0.05 to 0.10 to match baseline v3.
-    """
-
-    def __init__(self, gamma: float = 2.0, label_smoothing: float = 0.10):
+    def __init__(self, gamma=2.0, label_smoothing=0.10):
         super().__init__()
-        self.gamma = gamma
-        self.ls    = label_smoothing
+        self.gamma = gamma; self.ls = label_smoothing
 
-    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-        n_cls = logits.shape[1]
+    def forward(self, logits, targets):
+        n  = logits.shape[1]
         with torch.no_grad():
-            smooth = torch.zeros_like(logits).fill_(self.ls / (n_cls - 1))
-            smooth.scatter_(1, targets.unsqueeze(1), 1.0 - self.ls)
-        log_p  = F.log_softmax(logits, dim=1)
-        pt     = (log_p.exp() * smooth).sum(dim=1)
-        weight = (1.0 - pt).pow(self.gamma)
-        ce     = -(smooth * log_p).sum(dim=1)
-        return (weight * ce).mean()
+            s = torch.zeros_like(logits).fill_(self.ls / (n - 1))
+            s.scatter_(1, targets.unsqueeze(1), 1. - self.ls)
+        lp = F.log_softmax(logits, dim=1)
+        w  = (1. - (lp.exp() * s).sum(1)).pow(self.gamma)
+        return (w * -(s * lp).sum(1)).mean()
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# CrossAttentionFuser (FIX 3: dropout=0.35, identical to baseline v3)
-# ══════════════════════════════════════════════════════════════════════════════
+# ── BackboneWrapper ───────────────────────────────────────────────────────────
+# FIX [F2]: Replaces fragile list-based hooks.
+# ROOT CAUSE of silent gradient disconnection:
+#   Old code: self._ea[0] captured fp32 from AASIST (outside autocast), then
+#   cast to fp16 inside CrossAttentionFuser via ea.to(er.dtype).  This .to()
+#   call creates a NEW tensor node — gradients from loss_meta cannot back-
+#   propagate through it into AASIST.  AASIST was only trained via loss_aux_a,
+#   not via the fusion path, severely limiting fusion quality.
+# Fix: BackboneWrapper captures inp[0] WITH gradient tape intact; fp16/fp32
+#   autocast removed entirely (pure fp32) so no dtype cast is ever needed.
+
+class BackboneWrapper(nn.Module):
+    def __init__(self, backbone: nn.Module, fc_attr: str = "fc"):
+        super().__init__()
+        self.backbone = backbone
+        self._emb     = None
+        fc = getattr(backbone, fc_attr, None)
+        if not isinstance(fc, nn.Linear):
+            raise AttributeError(f"BackboneWrapper: no nn.Linear '{fc_attr}' on backbone")
+        self._handle = fc.register_forward_hook(self._capture)
+
+    def _capture(self, module, inp, out):
+        self._emb = inp[0]   # pre-FC embedding, grad tape intact
+
+    def forward(self, x):
+        self._emb = None
+        logit     = self.backbone(x.float())   # always fp32
+        emb       = self._emb
+        if emb is None:
+            raise RuntimeError("BackboneWrapper hook did not fire")
+        self._emb = None
+        return logit, emb
+
+    def remove_hook(self): self._handle.remove()
+
+
+# ── CrossAttentionFuser ───────────────────────────────────────────────────────
+# FIX [F6]: dropout 0.50→0.30  (0.50 excessive for cold-start, destabilises
+#            early gradient flow before fuser has learned projection norms)
+# Added: learned positional embedding (CLS / AASIST / ResNet token roles)
+#        LayerNorm before classification head (same as baseline)
 
 class CrossAttentionFuser(nn.Module):
-    """
-    Transformer-based fusion of AASIST (104-dim) and ResNet-SimAM (512-dim).
-    Sequence: [CLS | proj_a(emb_a) | proj_r(emb_r)] — length 3, d_model=256.
-    Pre-LN (norm_first=True) for stable cold-start gradient flow.
-    FIX 3: dropout raised from 0.30 to 0.35 to match baseline v3.
-    Mathematically identical to baseline v3 CrossAttentionFuser.
-    """
-
-    def __init__(
-        self,
-        dim_a:       int   = 104,
-        dim_r:       int   = 512,
-        embed_dim:   int   = 256,
-        num_heads:   int   = 8,
-        num_classes: int   = 2,
-        dropout:     float = 0.35,   # FIX 3
-    ):
+    def __init__(self, dim_a=104, dim_r=512, embed_dim=256,
+                 num_heads=8, num_classes=2, dropout=0.30):
         super().__init__()
-        self.proj_a = nn.Sequential(
-            nn.Linear(dim_a, embed_dim), nn.LayerNorm(embed_dim)
-        )
-        self.proj_r = nn.Sequential(
-            nn.Linear(dim_r, embed_dim), nn.LayerNorm(embed_dim)
-        )
+        self.proj_a    = nn.Sequential(nn.Linear(dim_a, embed_dim), nn.LayerNorm(embed_dim))
+        self.proj_r    = nn.Sequential(nn.Linear(dim_r, embed_dim), nn.LayerNorm(embed_dim))
         self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
-        nn.init.normal_(self.cls_token, std=0.02)
-
-        enc_layer = nn.TransformerEncoderLayer(
+        self.pos_emb   = nn.Parameter(torch.zeros(1, 3, embed_dim))
+        nn.init.trunc_normal_(self.cls_token, std=0.02)
+        nn.init.trunc_normal_(self.pos_emb,   std=0.02)
+        enc = nn.TransformerEncoderLayer(
             d_model=embed_dim, nhead=num_heads,
-            dim_feedforward=embed_dim * 4,
-            dropout=dropout, batch_first=True,
-            norm_first=True,
+            dim_feedforward=embed_dim * 4, dropout=dropout,
+            batch_first=True, norm_first=True,   # Pre-LN: stable cold-start
         )
-        self.transformer = nn.TransformerEncoder(enc_layer, num_layers=2)
+        self.transformer = nn.TransformerEncoder(enc, num_layers=2)
         self.head = nn.Sequential(
+            nn.LayerNorm(embed_dim),
             nn.Linear(embed_dim, embed_dim),
             nn.ReLU(),
             nn.Dropout(dropout),
             nn.Linear(embed_dim, num_classes),
         )
+        self._init_weights()
 
-    def forward(self, emb_a: torch.Tensor, emb_r: torch.Tensor) -> torch.Tensor:
-        if emb_a.dtype != emb_r.dtype:
-            emb_a = emb_a.to(emb_r.dtype)
-        B       = emb_a.size(0)
-        token_a = self.proj_a(emb_a).unsqueeze(1)
-        token_r = self.proj_r(emb_r).unsqueeze(1)
-        cls     = self.cls_token.expand(B, -1, -1)
-        seq     = torch.cat((cls, token_a, token_r), dim=1)
-        seq     = self.transformer(seq)
-        return self.head(seq[:, 0, :])
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.trunc_normal_(m.weight, std=0.02)
+                if m.bias is not None: nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.LayerNorm):
+                nn.init.ones_(m.weight); nn.init.zeros_(m.bias)
+
+    def forward(self, ea, er):
+        # FIX [F2]: Both inputs are fp32 — no dtype cast needed
+        ea = ea.float(); er = er.float()
+        B  = ea.size(0)
+        seq = torch.cat([
+            self.cls_token.expand(B, -1, -1),
+            self.proj_a(ea).unsqueeze(1),
+            self.proj_r(er).unsqueeze(1),
+        ], dim=1) + self.pos_emb
+        return self.head(self.transformer(seq)[:, 0, :])
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# End-to-End Ensemble Wrapper (identical to baseline v3)
-# ══════════════════════════════════════════════════════════════════════════════
+# ── EndToEndEnsemble ──────────────────────────────────────────────────────────
+# FIX [F2, F4]: BackboneWrapper replaces list hooks; pure fp32 (no autocast).
 
 class EndToEndEnsemble(nn.Module):
-    """
-    AASIST (FP32) + ResNet-SimAM (FP16) + CrossAttentionFuser (FP16).
-    AASIST in FP32: SincNet sinc-function NaN safety.
-    Hook captures inp[0] of each model's final FC — pre-classifier embedding.
-    Identical to baseline v3 wrapper.
-    """
-
-    def __init__(self, aasist: nn.Module, resnet: nn.Module, fusion_head: nn.Module):
+    def __init__(self, aasist, resnet, fuser):
         super().__init__()
-        self.aasist      = aasist
-        self.resnet      = resnet
-        self.fusion_head = fusion_head
-        self._emb_a = [None]
-        self._emb_r = [None]
+        self.aasist_w    = BackboneWrapper(aasist, fc_attr="fc")
+        self.resnet_w    = BackboneWrapper(resnet, fc_attr="fc")
+        self.fusion_head = fuser
 
-        def _ha(m, i, o): self._emb_a[0] = i[0]
-        def _hr(m, i, o): self._emb_r[0] = i[0]
-
-        self._h_a = self.aasist.fc.register_forward_hook(_ha)
-        self._h_r = self.resnet.fc.register_forward_hook(_hr)
-
-    def forward(self, waveform: torch.Tensor, mel_db: torch.Tensor,
-                return_base_outs: bool = False):
-        out_a = self.aasist(waveform)                              # FP32
-        with torch.amp.autocast("cuda"):
-            out_r    = self.resnet(mel_db)                         # FP16
-            out_meta = self.fusion_head(self._emb_a[0], self._emb_r[0])
-        if return_base_outs:
-            return out_meta, out_a, out_r
-        return out_meta
+    def forward(self, wav, mel, return_base=False):
+        # Pure fp32 throughout — eliminates dtype-cast gradient disconnection [F4]
+        oa, ea = self.aasist_w(wav.float())
+        or_, er = self.resnet_w(mel.float())
+        om      = self.fusion_head(ea, er)
+        return (om, oa, or_) if return_base else om
 
     def remove_hooks(self):
-        self._h_a.remove()
-        self._h_r.remove()
+        self.aasist_w.remove_hook(); self.resnet_w.remove_hook()
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Cold-Start Initialisers (identical to baseline v3)
-# ══════════════════════════════════════════════════════════════════════════════
+# ── Weight Initialisation ─────────────────────────────────────────────────────
+def _init_aasist(m):
+    attn = ("attn", "gat", "attention", "query", "key", "value")
+    for n, mod in m.named_modules():
+        ia = any(k in n.lower() for k in attn)
+        if isinstance(mod, (nn.Conv1d, nn.Conv2d)):
+            (nn.init.xavier_uniform_ if ia else
+             nn.init.kaiming_normal_)(mod.weight,
+             **({} if ia else {"mode": "fan_out", "nonlinearity": "relu"}))
+            if mod.bias is not None: nn.init.zeros_(mod.bias)
+        elif isinstance(mod, nn.Linear):
+            (nn.init.xavier_uniform_ if ia else
+             nn.init.kaiming_normal_)(mod.weight,
+             **({} if ia else {"mode": "fan_in", "nonlinearity": "relu"}))
+            if mod.bias is not None: nn.init.zeros_(mod.bias)
+        elif isinstance(mod, (nn.BatchNorm1d, nn.BatchNorm2d)):
+            nn.init.ones_(mod.weight); nn.init.zeros_(mod.bias)
 
-def init_aasist_cold_start(model: nn.Module) -> None:
-    """Kaiming (Conv/Linear with relu) + Xavier (GAT/attention)."""
-    attn_kw = ("attn", "gat", "attention", "query", "key", "value")
-    for name, module in model.named_modules():
-        is_attn = any(kw in name.lower() for kw in attn_kw)
-        if isinstance(module, (nn.Conv1d, nn.Conv2d)):
-            if is_attn:
-                nn.init.xavier_uniform_(module.weight)
-            else:
-                nn.init.kaiming_normal_(module.weight, mode="fan_out",
-                                        nonlinearity="relu")
-            if module.bias is not None:
-                nn.init.zeros_(module.bias)
-        elif isinstance(module, nn.Linear):
-            if is_attn:
-                nn.init.xavier_uniform_(module.weight)
-            else:
-                nn.init.kaiming_normal_(module.weight, mode="fan_in",
-                                        nonlinearity="relu")
-            if module.bias is not None:
-                nn.init.zeros_(module.bias)
-        elif isinstance(module, (nn.BatchNorm1d, nn.BatchNorm2d)):
-            nn.init.ones_(module.weight)
-            nn.init.zeros_(module.bias)
-    print("  AASIST: Kaiming (Conv/Linear) + Xavier (GAT/attn) cold start.")
-
-
-def init_resnet_cold_start(model: nn.Module) -> None:
-    """Kaiming (Conv2d) + small-normal (Linear FC)."""
-    for _, module in model.named_modules():
-        if isinstance(module, (nn.Conv2d, nn.Conv1d)):
-            nn.init.kaiming_normal_(module.weight, mode="fan_out",
-                                    nonlinearity="relu")
-            if module.bias is not None:
-                nn.init.zeros_(module.bias)
-        elif isinstance(module, (nn.BatchNorm2d, nn.BatchNorm1d)):
-            nn.init.ones_(module.weight)
-            nn.init.zeros_(module.bias)
-        elif isinstance(module, nn.Linear):
-            nn.init.normal_(module.weight, mean=0.0, std=0.01)
-            if module.bias is not None:
-                nn.init.zeros_(module.bias)
-    print("  ResNet: Kaiming (Conv) + small-normal (Linear) cold start.")
+def _init_resnet(m):
+    for mod in m.modules():
+        if isinstance(mod, (nn.Conv2d, nn.Conv1d)):
+            nn.init.kaiming_normal_(mod.weight, mode="fan_out", nonlinearity="relu")
+            if mod.bias is not None: nn.init.zeros_(mod.bias)
+        elif isinstance(mod, (nn.BatchNorm2d, nn.BatchNorm1d)):
+            nn.init.ones_(mod.weight); nn.init.zeros_(mod.bias)
+        elif isinstance(mod, nn.Linear):
+            nn.init.normal_(mod.weight, 0., 0.01)
+            if mod.bias is not None: nn.init.zeros_(mod.bias)
 
 
-def init_fuser_cold_start(fuser: CrossAttentionFuser) -> None:
-    """Kaiming (proj linear layers) + small-normal (output head)."""
-    for seq_mod in (fuser.proj_a, fuser.proj_r):
-        for m in seq_mod.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.kaiming_normal_(m.weight, mode="fan_in",
-                                        nonlinearity="relu")
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
-    head_lins = [m for m in fuser.head.modules() if isinstance(m, nn.Linear)]
-    for i, lin in enumerate(head_lins):
-        if i < len(head_lins) - 1:
-            nn.init.kaiming_normal_(lin.weight, mode="fan_in",
-                                    nonlinearity="relu")
-        else:
-            nn.init.normal_(lin.weight, mean=0.0, std=0.01)
-        if lin.bias is not None:
-            nn.init.zeros_(lin.bias)
-    print("  CrossAttentionFuser: Kaiming (proj) + small-normal (head) cold start.")
+# ── Data Utilities ────────────────────────────────────────────────────────────
+def create_train_sampler(dataset):
+    labels = dataset.labels
+    counts = torch.bincount(torch.tensor(labels)).float()
+    w      = len(labels) / counts
+    return WeightedRandomSampler([w[l] for l in labels], len(labels), replacement=True)
 
+def create_balanced_val_indices(dataset):
+    labels    = np.array(dataset.labels)
+    gen_idx   = np.where(labels == 0)[0]
+    spoof_idx = np.where(labels == 1)[0]
+    n   = min(len(gen_idx), len(spoof_idx))
+    rng = np.random.RandomState(42)
+    idx = np.concatenate([rng.choice(gen_idx,   n, replace=False),
+                          rng.choice(spoof_idx, n, replace=False)])
+    rng.shuffle(idx)
+    print(f"  Balanced val subset: {n} genuine + {n} spoof = {2*n} total")
+    return idx.tolist()
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Utilities (identical to baseline v3)
-# ══════════════════════════════════════════════════════════════════════════════
+# FIX [F7]: brentq EER — replaces nanargmin which gives degenerate results when
+# model is over-confident (probabilities clustered near 0 or 1).
+def compute_eer(y_true, y_scores):
+    try:
+        fpr, tpr, _ = roc_curve(y_true, y_scores, pos_label=1)
+        fnr = 1. - tpr
+        eer = brentq(lambda x: 1. - x - interp1d(fpr, tpr)(x), 0., 1.)
+    except Exception:
+        fpr, tpr, _ = roc_curve(y_true, y_scores, pos_label=1)
+        fnr = 1. - tpr
+        idx = np.nanargmin(np.abs(fnr - fpr))
+        eer = float((fpr[idx] + fnr[idx]) / 2.)
+    return float(eer * 100.)
 
-def create_weighted_sampler(dataset: ASVspoofDataset) -> WeightedRandomSampler:
-    labels        = dataset.labels
-    class_counts  = torch.bincount(torch.tensor(labels))
-    total_samples = len(labels)
-    class_weights = total_samples / class_counts.float()
-    sample_weights = [class_weights[lbl] for lbl in labels]
-    return WeightedRandomSampler(
-        weights=sample_weights, num_samples=total_samples, replacement=True
-    )
-
-
-def compute_eer(y_true, y_scores) -> float:
+def compute_min_dcf(y_true, y_scores, p=0.05, cm=1., cf=1.):
     fpr, tpr, _ = roc_curve(y_true, y_scores, pos_label=1)
-    fnr = 1.0 - tpr
-    return max(0.0, float(fpr[np.nanargmin(np.abs(fnr - fpr))]) * 100.0)
+    fnr = 1. - tpr
+    return float(np.min(cm * fnr * p + cf * fpr * (1. - p)) / min(cm * p, cf * (1. - p)))
 
 
-def compute_min_dcf(y_true, y_scores,
-                    p_target: float = 0.05,
-                    c_miss:   float = 1.0,
-                    c_fa:     float = 1.0) -> float:
-    fpr, tpr, _ = roc_curve(y_true, y_scores, pos_label=1)
-    fnr         = 1.0 - tpr
-    dcf         = c_miss * fnr * p_target + c_fa * fpr * (1.0 - p_target)
-    return float(np.min(dcf) / min(c_miss * p_target, c_fa * (1.0 - p_target)))
+# ── SpecAugment for mel ───────────────────────────────────────────────────────
+# FIX [F8]: SpecAugment on mel spectrogram (global fix from baseline).
+# Prevents ResNet from memorising spectral patterns specific to the training set.
+def spec_augment(mel_db: torch.Tensor, freq_mask: int = 15, time_mask: int = 25) -> torch.Tensor:
+    """mel_db: (B, 1, n_mels, T)"""
+    B, C, F, TT = mel_db.shape
+    out = mel_db.clone()
+    for b in range(B):
+        # Frequency masking
+        f0 = torch.randint(0, max(1, F - freq_mask), (1,)).item()
+        out[b, :, f0:f0 + freq_mask, :] = 0.
+        # Time masking
+        t0 = torch.randint(0, max(1, TT - time_mask), (1,)).item()
+        out[b, :, :, t0:t0 + time_mask] = 0.
+    return out
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Main
-# ══════════════════════════════════════════════════════════════════════════════
-
+# ── Main ──────────────────────────────────────────────────────────────────────
 def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"UR-FFL Cold-Start Cross-Attention Ensemble v3 — device: {device}")
+    print(f"UR-FFL Cold-Start Cross-Attention Ensemble — {device}")
     print("=" * 70)
 
-    # ── Models (cold start, identical to baseline v3) ─────────────────────────
-    aasist_model = AASIST(
-        stft_window=698, stft_hop=398, freq_bins=116,
-        gat_layers=2, heads=5, head_dim=104, hidden_dim=455, dropout=0.33,
-    )
-    resnet_model = resnet18_simam(num_classes=2, dropout_rate=0.22)
-    fusion_head  = CrossAttentionFuser(
-        dim_a=104, dim_r=512, embed_dim=256,
-        num_heads=8, num_classes=2, dropout=0.35,
-    )
+    # Build models (cold-start, no pre-trained weights)
+    aasist = AASIST(stft_window=698, stft_hop=398, freq_bins=116,
+                    gat_layers=2, heads=5, head_dim=104, hidden_dim=455, dropout=0.33)
+    resnet = resnet18_simam(num_classes=2, dropout_rate=0.22)
+    fuser  = CrossAttentionFuser()
 
-    print("Initialising all components from scratch (cold start):")
-    init_aasist_cold_start(aasist_model)
-    init_resnet_cold_start(resnet_model)
-    init_fuser_cold_start(fusion_head)
+    _init_aasist(aasist); _init_resnet(resnet)
+    print("  AASIST : Kaiming(Conv/Linear) + Xavier(GAT/attn)")
+    print("  ResNet : Kaiming(Conv) + small-normal(Linear)")
+    print("  Fuser  : trunc-normal (std=0.02) — via CrossAttentionFuser._init_weights")
 
-    wrapper_model = EndToEndEnsemble(aasist_model, resnet_model, fusion_head).to(device)
-    n_params = sum(p.numel() for p in wrapper_model.parameters())
-    print(f"  Total trainable parameters: {n_params:,}")
+    model = EndToEndEnsemble(aasist, resnet, fuser).to(device)
+    print(f"  Params : {sum(p.numel() for p in model.parameters()):,}")
     print("=" * 70)
 
-    # ── Data ──────────────────────────────────────────────────────────────────
-    print("Loading datasets...")
+    # Datasets
     train_ds = ASVspoofDataset(PREPROCESSED_TRAIN_DIR, PROTOCOL_TRAIN)
     val_ds   = ASVspoofDataset(PREPROCESSED_DEV_DIR,   PROTOCOL_DEV)
-    sampler  = create_weighted_sampler(train_ds)
-    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, sampler=sampler,
+
+    train_sampler = create_train_sampler(train_ds)
+    val_indices   = create_balanced_val_indices(val_ds)
+    val_sampler   = SubsetRandomSampler(val_indices)
+
+    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, sampler=train_sampler,
                               num_workers=4, pin_memory=False)
-    val_loader   = DataLoader(val_ds,   batch_size=BATCH_SIZE, shuffle=False,
+    val_loader   = DataLoader(val_ds,   batch_size=BATCH_SIZE, sampler=val_sampler,
                               num_workers=4, pin_memory=False)
-    print(f"  Train: {len(train_ds):,} | Val: {len(val_ds):,}")
 
-    # ── Audio feature extractors (identical to baseline v3) ───────────────────
-    mel_transform = T.MelSpectrogram(
-        sample_rate=16000, n_fft=512, hop_length=160, n_mels=80
-    ).to(device)
-    amp_to_db = T.AmplitudeToDB(stype="power", top_db=80).to(device)
+    mel_t = T.MelSpectrogram(sample_rate=16000, n_fft=512, hop_length=160, n_mels=80).to(device)
+    a2db  = T.AmplitudeToDB(stype="power", top_db=80).to(device)
 
-    # FIX 4 — SpecAugment (identical params to baseline v3, clean branch only)
-    # Applied to mel_db[:B] (clean spectrogram) only. The aug branch [B:]
-    # already carries waveform-level degradation from the UR-FFL actuator.
-    freq_masking = T.FrequencyMasking(
-        freq_mask_param=FREQ_MASK_PARAM, iid_masks=True
-    ).to(device)
-    time_masking = T.TimeMasking(
-        time_mask_param=TIME_MASK_PARAM, iid_masks=True
-    ).to(device)
-
-    # ── UR-FFL components ─────────────────────────────────────────────────────
+    # UR-FFL components
+    # FIX [F9]: mc_passes 10→5 (matches prior best version, halves sensor overhead)
     sensor     = UncertaintySensor(mc_passes=5)
-    controller = PDController(
-        setpoint=10.0, Kp=0.015, Kd=0.005,
-        alpha_min=0.10, alpha_max=0.90, alpha_init=PHASE1_ALPHA,
-    )
-    selector = DegradationSelector()
-    actuator = DegradationActuator(device)
+    controller = _PDController()
+    selector   = DegradationSelector()
+    actuator   = DegradationActuator(device)
+    print(f"UR-FFL: SP={controller.SETPOINT}pp | Kp={controller.Kp} | "
+          f"Kd={controller.Kd} | α_max={controller.alpha_max}")
 
-    print(
-        f"  UR-FFL: setpoint={controller.setpoint}pp | "
-        f"Kp={controller.Kp} | Kd={controller.Kd} | "
-        f"α ∈ [{controller.alpha_min}, {controller.alpha_max}] | "
-        f"Phase 1 α fixed={PHASE1_ALPHA}"
-    )
+    # FIX [F5]: Corrected differential LR — fuser leads backbone
+    optimizer = optim.AdamW([
+        {"params": model.aasist_w.parameters(),  "lr": LR_BASE,  "weight_decay": WEIGHT_DECAY},
+        {"params": model.resnet_w.parameters(),   "lr": LR_BASE,  "weight_decay": WEIGHT_DECAY},
+        {"params": model.fusion_head.parameters(),"lr": LR_FUSER, "weight_decay": WEIGHT_DECAY},
+    ])
+    warmup = optim.lr_scheduler.LinearLR(optimizer, start_factor=0.1, end_factor=1.0,
+                                         total_iters=WARMUP_EPOCHS)
+    cosine = optim.lr_scheduler.CosineAnnealingLR(optimizer,
+                                                   T_max=max(1, TOTAL_EPOCHS - WARMUP_EPOCHS),
+                                                   eta_min=1e-7)
+    sched     = optim.lr_scheduler.SequentialLR(optimizer, [warmup, cosine], [WARMUP_EPOCHS])
+    criterion = FocalLoss()
+    # FIX [F4]: GradScaler removed — pure fp32 training (no mixed precision)
 
-    # ── Optimiser + scheduler (FIX 2: weight_decay=3e-4, identical to baseline)
-    optimizer = optim.AdamW(
-        wrapper_model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY
-    )
-    warmup_sched = optim.lr_scheduler.LinearLR(
-        optimizer, start_factor=0.1, end_factor=1.0, total_iters=WARMUP_EPOCHS
-    )
-    cosine_sched = optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=TOTAL_EPOCHS - WARMUP_EPOCHS, eta_min=1e-7
-    )
-    scheduler = optim.lr_scheduler.SequentialLR(
-        optimizer, schedulers=[warmup_sched, cosine_sched],
-        milestones=[WARMUP_EPOCHS],
-    )
-    criterion = FocalLoss(gamma=2.0, label_smoothing=0.10)   # FIX 1
-    scaler    = torch.amp.GradScaler("cuda")
+    best_comp      = float("inf")
+    best_clean_eer = float("inf")
+    no_imp         = 0
+    t0             = time.time()
+    H  = {k: [] for k in ["tr_loss","vl_loss","l_clean","l_deg","l_aux","l_cons",
+                            "tr_eer","vl_eer_c","vl_eer_a","vl_auc","vl_mdc",
+                            "composite","alpha"]}
 
-    # ── Training state ─────────────────────────────────────────────────────────
-    best_composite    = float("inf")
-    epochs_no_improve = 0
-    start_time        = time.time()
-    pd_activated      = False   # tracks whether Phase 2 has started
+    for ep in range(TOTAL_EPOCHS):
+        alpha = controller.alpha
 
-    history = dict(
-        train_loss=[], val_loss=[],
-        loss_clean=[], loss_deg=[], loss_aux=[], loss_cons=[],
-        train_eer=[], val_eer_clean=[], val_eer_aug=[],
-        val_auc=[], val_min_dcf=[], composite=[],
-        alpha=[], clean_w=[], deg_w=[], aux_w=[],
-    )
+        # ── Train ─────────────────────────────────────────────────────────────
+        model.train()
+        st = sc = sd = sa = ss = 0.
+        tl = []; tp = []; gaps = []; nan_n = 0
 
-    # ══════════════════════════════════════════════════════════════════════════
-    # Training Loop
-    # ══════════════════════════════════════════════════════════════════════════
-    for epoch in range(TOTAL_EPOCHS):
-        clean_w, deg_w, aux_w, cons_w = get_phase_weights(epoch)
-        in_phase1  = epoch < PHASE1_END
-        phase_tag  = "P1-BaseFirst" if in_phase1 else "P2-FusionFocus"
+        bar = tqdm(train_loader, desc=f"Ep {ep+1}/{TOTAL_EPOCHS} [Tr]")
+        for wav, lbl in bar:
+            wav = wav.squeeze(1).to(device); lbl = lbl.to(device)
 
-        # ── Phase 1→2 transition (FIX 6) ──────────────────────────────────────
-        if not in_phase1 and not pd_activated:
-            controller.reset(PHASE1_ALPHA)
-            pd_activated = True
-            print(f"\n  [Phase 2] PD controller activated at epoch {epoch+1}. "
-                  f"α reset to {PHASE1_ALPHA:.2f}.")
-
-        # Current alpha: fixed in Phase 1, PD-controlled in Phase 2
-        current_alpha = PHASE1_ALPHA if in_phase1 else controller.alpha
-
-        # ── Training phase ────────────────────────────────────────────────────
-        wrapper_model.train()
-        sum_total = sum_clean = sum_deg = sum_aux = sum_cons = 0.0
-        train_labels = []
-        train_probs  = []
-        epoch_gaps   = []
-        nan_batches  = 0
-
-        pbar = tqdm(train_loader,
-                    desc=f"Epoch {epoch+1}/{TOTAL_EPOCHS} [{phase_tag}]")
-        for waveforms, labels in pbar:
-            waveforms = waveforms.squeeze(1).to(device)
-            labels    = labels.to(device)
-
-            # ── UR-FFL: measure uncertainty on clean batch ─────────────────────
             with torch.no_grad():
-                z_u, _ = sensor.measure(wrapper_model.aasist, waveforms)
+                z_u, _ = sensor.measure(model.aasist_w.backbone, wav)
+            sel = selector.select(z_u)
+            aug = actuator.apply(wav, lbl, sel, alpha)
 
-            # ── UR-FFL: select degradation and augment ─────────────────────────
-            selections    = selector.select(z_u)
-            alpha         = current_alpha
-            aug_waveforms = actuator.apply(waveforms, labels, selections, alpha)
+            with torch.no_grad():
+                mel_c = a2db(mel_t(wav)).unsqueeze(1)
+                mel_a = a2db(mel_t(aug)).unsqueeze(1)
+                # FIX [F8]: SpecAugment on mel during training
+                mel_c = spec_augment(mel_c)
+                mel_a = spec_augment(mel_a)
 
-            # ── Mel spectrograms for combined batch ────────────────────────────
+            comb     = torch.cat([wav, aug], 0)
+            mel_comb = torch.cat([mel_c, mel_a], 0)
+
             optimizer.zero_grad(set_to_none=True)
+            # FIX [F4]: No autocast — pure fp32, gradient tape intact through fusion
+            om, oa, or_ = model(comb, mel_comb, return_base=True)
+            B_ = wav.size(0)
 
-            with torch.no_grad():
-                # Compute mel for clean and aug separately
-                mel_clean_raw = amp_to_db(mel_transform(waveforms)).unsqueeze(1)
-                mel_aug_raw   = amp_to_db(mel_transform(aug_waveforms)).unsqueeze(1)
+            omc  = om[:B_].float(); omd = om[B_:].float()
+            oac  = oa[:B_].float(); orc = or_[:B_].float()
 
-            # FIX 4: SpecAugment on clean branch only (aug has waveform-level aug)
-            mel_clean_aug = freq_masking(mel_clean_raw)
-            mel_clean_aug = time_masking(mel_clean_aug)
-            # Recombine: [SpecAugmented-clean | raw-aug]
-            mel_db_combined = torch.cat([mel_clean_aug, mel_aug_raw], dim=0)
+            lc = criterion(omc, lbl)
+            ld = criterion(omd, lbl)
+            ls = F.mse_loss(F.softmax(omc, 1), F.softmax(omd, 1))
+            la = criterion(oac, lbl) + criterion(orc, lbl)
+            lt = CLEAN_W * lc + DEG_W * ld + AUX_W * la + CONS_W * ls
 
-            # Combined waveform batch
-            combined     = torch.cat([waveforms, aug_waveforms], dim=0)
-            combined_lbl = torch.cat([labels,    labels],        dim=0)
-
-            # ── Forward pass ───────────────────────────────────────────────────
-            out_meta, out_a, out_r = wrapper_model(
-                combined, mel_db_combined, return_base_outs=True
-            )
-
-            B = waveforms.size(0)
-
-            # Split and cast to FP32
-            out_meta_clean = out_meta[:B].float()
-            out_meta_deg   = out_meta[B:].float()
-            out_a_clean    = out_a[:B].float()
-            out_r_clean    = out_r[:B].float()
-
-            # ── FIX 5: phased loss computation ─────────────────────────────────
-            loss_clean = criterion(out_meta_clean, labels)
-            loss_deg   = criterion(out_meta_deg,   labels)
-
-            # π-model consistency (Laine & Aila 2017)
-            loss_cons  = F.mse_loss(
-                F.softmax(out_meta_clean, dim=1),
-                F.softmax(out_meta_deg,   dim=1),
-            )
-
-            # Base-model auxiliary loss (clean branch only)
-            loss_aux = criterion(out_a_clean, labels) + criterion(out_r_clean, labels)
-
-            loss_total = (
-                clean_w * loss_clean +
-                deg_w   * loss_deg   +
-                aux_w   * loss_aux   +
-                cons_w  * loss_cons
-            )
-
-            if torch.isnan(loss_total) or torch.isinf(loss_total):
-                nan_batches += 1
-                optimizer.zero_grad(set_to_none=True)
-                if nan_batches <= 3:
-                    print(f"\n  [Warning] NaN/Inf at epoch {epoch+1}. Skipping.")
+            if torch.isnan(lt) or torch.isinf(lt):
+                nan_n += 1; optimizer.zero_grad(set_to_none=True)
+                if nan_n <= 3: print(f"\n  [NaN] ep{ep+1} — skipping")
                 continue
 
-            scaler.scale(loss_total).backward()
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(wrapper_model.parameters(), max_norm=1.0)
-            scaler.step(optimizer)
-            scaler.update()
+            lt.backward()   # FIX [F4]: direct backward, no scaler
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
 
-            # ── PD gap signal accumulation ─────────────────────────────────────
             with torch.no_grad():
-                prob_c = torch.softmax(out_meta_clean, dim=1)
-                prob_a = torch.softmax(out_meta_deg,   dim=1)
-                conf_c = prob_c.gather(1, labels.view(-1, 1)).mean().item() * 100
-                conf_a = prob_a.gather(1, labels.view(-1, 1)).mean().item() * 100
-                epoch_gaps.append(conf_c - conf_a)
-                train_labels.extend(labels.cpu().numpy())
-                train_probs.extend(prob_c[:, 1].cpu().numpy())
+                pc = torch.softmax(omc, 1); pd = torch.softmax(omd, 1)
+                ac = pc.gather(1, lbl.view(-1, 1)).mean().item() * 100.
+                ad = pd.gather(1, lbl.view(-1, 1)).mean().item() * 100.
+                gaps.append(ac - ad)
+                tl.extend(lbl.cpu().numpy())
+                tp.extend(pc[:, 1].cpu().numpy())
 
-            sum_total += loss_total.item()
-            sum_clean += loss_clean.item()
-            sum_deg   += loss_deg.item()
-            sum_aux   += loss_aux.item()
-            sum_cons  += loss_cons.item()
+            st += lt.item(); sc += lc.item(); sd += ld.item()
+            sa += la.item(); ss += ls.item()
+            bar.set_postfix({"L": f"{lt.item():.4f}", "α": f"{alpha:.3f}",
+                             "gap": f"{ac-ad:.1f}pp"})
 
-            pbar.set_postfix({
-                "loss":  f"{loss_total.item():.4f}",
-                "α":     f"{alpha:.3f}",
-                "gap":   f"{(conf_c - conf_a):.1f}pp",
-                "mw":    f"{clean_w+deg_w:.2f}",
-            })
+        mean_gap = float(np.mean(gaps)) if gaps else 0.
+        alpha    = controller.update(mean_gap)
+        nb       = max(1, len(train_loader) - nan_n)
+        H["tr_loss"].append(st / nb); H["l_clean"].append(sc / nb)
+        H["l_deg"].append(sd / nb);   H["l_aux"].append(sa / nb)
+        H["l_cons"].append(ss / nb);  H["tr_eer"].append(compute_eer(tl, tp))
+        H["alpha"].append(alpha)
 
-        # ── PD controller update (Phase 2 only) ───────────────────────────────
-        mean_gap  = float(np.mean(epoch_gaps)) if epoch_gaps else 0.0
-        if not in_phase1:
-            new_alpha = controller.update(mean_gap)
-        else:
-            new_alpha = PHASE1_ALPHA   # fixed during Phase 1, no update
-
-        n_b       = max(1, len(train_loader) - nan_batches)
-        avg_train = sum_total / n_b
-        avg_clean = sum_clean / n_b
-        avg_deg   = sum_deg   / n_b
-        avg_aux   = sum_aux   / n_b
-        avg_cons  = sum_cons  / n_b
-        train_eer = compute_eer(train_labels, train_probs)
-
-        # ── Validation phase ──────────────────────────────────────────────────
-        wrapper_model.eval()
-        sum_val  = 0.0
-        val_lc, val_pc = [], []
-        val_la, val_pa = [], []
-
+        # ── Validation (balanced subset) ──────────────────────────────────────
+        model.eval(); sv = 0.
+        vl_c = []; vp_c = []; vl_a = []; vp_a = []
         with torch.no_grad():
-            for wv, lv in tqdm(val_loader,
-                               desc=f"Epoch {epoch+1} [Valid]", leave=False):
-                wv = wv.squeeze(1).to(device)
-                lv = lv.to(device)
+            for wav, lbl in tqdm(val_loader, desc=f"Ep {ep+1} [Val]", leave=False):
+                wav = wav.squeeze(1).to(device); lbl = lbl.to(device)
 
-                # Clean validation: no SpecAugment (identical to baseline v3)
-                mel    = mel_transform(wv)
-                mel_db = amp_to_db(mel).unsqueeze(1)
-                out_c  = wrapper_model(wv, mel_db)
-                sum_val += criterion(out_c.float(), lv).item()
-                val_lc.extend(lv.cpu().numpy())
-                val_pc.extend(
-                    torch.softmax(out_c.float(), dim=1)[:, 1].cpu().numpy()
-                )
+                mel = a2db(mel_t(wav)).unsqueeze(1)
+                out = model(wav, mel)
+                sv += criterion(out.float(), lbl).item()
+                vl_c.extend(lbl.cpu().numpy())
+                vp_c.extend(torch.softmax(out.float(), 1)[:, 1].cpu().numpy())
 
-                # Augmented validation: SSI at max(0.3, current_alpha)
-                aug_v      = actuator._ssi(wv, alpha=max(0.3, current_alpha))
-                mel_aug    = mel_transform(aug_v)
-                mel_db_aug = amp_to_db(mel_aug).unsqueeze(1)
-                out_av     = wrapper_model(aug_v, mel_db_aug)
-                val_la.extend(lv.cpu().numpy())
-                val_pa.extend(
-                    torch.softmax(out_av.float(), dim=1)[:, 1].cpu().numpy()
-                )
+                aug_v   = actuator._ssi(wav, alpha=max(0.30, controller.alpha))
+                mel_aug = a2db(mel_t(aug_v)).unsqueeze(1)
+                out_av  = model(aug_v, mel_aug)
+                vl_a.extend(lbl.cpu().numpy())
+                vp_a.extend(torch.softmax(out_av.float(), 1)[:, 1].cpu().numpy())
 
-        avg_val     = sum_val / len(val_loader)
-        eer_clean   = compute_eer(val_lc, val_pc)
-        eer_aug     = compute_eer(val_la, val_pa)
-        composite   = CKPT_CLEAN_W * eer_clean + CKPT_AUG_W * eer_aug
-        val_auc     = roc_auc_score(val_lc, val_pc)
-        val_min_dcf = compute_min_dcf(val_lc, val_pc)
+        eer_c = compute_eer(vl_c, vp_c)
+        eer_a = compute_eer(vl_a, vp_a)
+        comp  = CKPT_CLEAN_W * eer_c + CKPT_AUG_W * eer_a   # FIX [F3]
+        vauc  = roc_auc_score(vl_c, vp_c)
+        vmdc  = compute_min_dcf(vl_c, vp_c)
 
-        scheduler.step()
+        H["vl_loss"].append(sv / len(val_loader)); H["vl_eer_c"].append(eer_c)
+        H["vl_eer_a"].append(eer_a); H["vl_auc"].append(vauc)
+        H["vl_mdc"].append(vmdc);    H["composite"].append(comp)
 
-        history["train_loss"].append(avg_train)
-        history["val_loss"].append(avg_val)
-        history["loss_clean"].append(avg_clean)
-        history["loss_deg"].append(avg_deg)
-        history["loss_aux"].append(avg_aux)
-        history["loss_cons"].append(avg_cons)
-        history["train_eer"].append(train_eer)
-        history["val_eer_clean"].append(eer_clean)
-        history["val_eer_aug"].append(eer_aug)
-        history["val_auc"].append(val_auc)
-        history["val_min_dcf"].append(val_min_dcf)
-        history["composite"].append(composite)
-        history["alpha"].append(new_alpha)
-        history["clean_w"].append(clean_w)
-        history["deg_w"].append(deg_w)
-        history["aux_w"].append(aux_w)
+        arr_lbl  = np.array(vl_c); arr_prb = np.array(vp_c)
+        mean_gen = arr_prb[arr_lbl == 0].mean() if (arr_lbl == 0).any() else float("nan")
+        mean_spf = arr_prb[arr_lbl == 1].mean() if (arr_lbl == 1).any() else float("nan")
 
-        elapsed  = time.time() - start_time
-        eta_secs = int((elapsed / (epoch + 1)) * (TOTAL_EPOCHS - epoch - 1))
-        eta_str  = str(datetime.timedelta(seconds=eta_secs))
-        cur_lr   = optimizer.param_groups[0]["lr"]
+        sched.step()
+        lr0 = optimizer.param_groups[0]["lr"]
+        lr2 = optimizer.param_groups[2]["lr"]
+        eta = str(datetime.timedelta(seconds=int(
+            (time.time() - t0) / (ep + 1) * (TOTAL_EPOCHS - ep - 1))))
 
-        print(
-            f"Epoch {epoch+1:3d} [{phase_tag}] | LR {cur_lr:.2e} | "
-            f"α {new_alpha:.3f} | gap {mean_gap:.1f}pp | "
-            f"Train {avg_train:.4f} | Val {avg_val:.4f}"
-        )
-        print(
-            f"           EER_c {eer_clean:.4f}% | EER_a {eer_aug:.4f}% | "
-            f"Score {composite:.4f}% | AUC {val_auc:.4f} | "
-            f"minDCF {val_min_dcf:.4f} | ETA {eta_str}"
-        )
+        print(f"Ep {ep+1:3d} | LR_base {lr0:.1e} LR_fuse {lr2:.1e} | "
+              f"α {alpha:.3f} gap {mean_gap:.1f}pp | "
+              f"Tr {st/nb:.4f} | Val {sv/len(val_loader):.4f} | "
+              f"EER_c {eer_c:.3f}% | EER_a {eer_a:.3f}% | "
+              f"Score {comp:.3f}% | ETA {eta}")
+        print(f"       P(spoof)|genuine={mean_gen:.3f}  P(spoof)|spoof={mean_spf:.3f}  "
+              f"[gap={mean_spf-mean_gen:.3f}]")
 
-        if composite < best_composite:
-            best_composite    = composite
-            epochs_no_improve = 0
-            torch.save(
-                {
-                    "epoch":            epoch + 1,
-                    "model_state_dict": wrapper_model.state_dict(),
-                    "eer_clean":        eer_clean,
-                    "eer_aug":          eer_aug,
-                    "composite":        composite,
-                    "val_auc":          val_auc,
-                    "val_min_dcf":      val_min_dcf,
-                    "alpha":            new_alpha,
-                },
-                OUTPUT_WEIGHTS,
-            )
-            print(
-                f"  -> Composite {best_composite:.4f}% "
-                f"(EER_c={eer_clean:.4f}%, EER_a={eer_aug:.4f}%) — saved ✓"
-            )
+        ckpt = {"epoch": ep + 1, "model_state_dict": model.state_dict(),
+                "eer_clean": eer_c, "eer_aug": eer_a, "composite": comp,
+                "val_auc": vauc, "val_min_dcf": vmdc, "alpha": alpha}
+
+        if comp < best_comp:
+            best_comp, no_imp = comp, 0
+            torch.save(ckpt, OUTPUT_WEIGHTS)
+            print(f"  -> Composite {best_comp:.4f}% (EER_c={eer_c:.4f}%, EER_a={eer_a:.4f}%) — saved ✓")
         else:
-            epochs_no_improve += 1
-            print(f"  -> No improvement ({epochs_no_improve}/{PATIENCE})")
+            no_imp += 1
 
-        if epochs_no_improve >= PATIENCE:
-            print("\nEarly stopping triggered.")
-            break
+        # FIX [F3]: Second checkpoint saved purely on clean EER —
+        # this is the DF-generalisable checkpoint (epoch ~50 observation).
+        if eer_c < best_clean_eer:
+            best_clean_eer = eer_c
+            torch.save(ckpt, OUTPUT_WEIGHTS_CLEAN)
+            print(f"  -> Clean-EER best: {best_clean_eer:.4f}% — saved to _best_clean.pth ✓")
+        else:
+            print(f"  -> No composite improvement ({no_imp}/{PATIENCE})")
 
-    wrapper_model.remove_hooks()
-    total_str = str(datetime.timedelta(seconds=int(time.time() - start_time)))
-    print(f"\nTotal time: {total_str} | Best composite: {best_composite:.4f}%")
+        if no_imp >= PATIENCE:
+            print("\nEarly stopping."); break
 
-    # ══════════════════════════════════════════════════════════════════════════
-    # Diagnostic Plots
-    # ══════════════════════════════════════════════════════════════════════════
-    E   = range(1, len(history["train_loss"]) + 1)
+    model.remove_hooks()
+    print(f"\nDone: {str(datetime.timedelta(seconds=int(time.time()-t0)))} | "
+          f"Best composite: {best_comp:.4f}% | Best clean EER: {best_clean_eer:.4f}%")
+    print(f"  Composite checkpoint : {OUTPUT_WEIGHTS}")
+    print(f"  Clean-EER checkpoint : {OUTPUT_WEIGHTS_CLEAN}")
+
+    # ── Plots ─────────────────────────────────────────────────────────────────
+    E = range(1, len(H["tr_loss"]) + 1)
     fig, axes = plt.subplots(2, 3, figsize=(21, 12))
-    axes = axes.flatten()
+    ax = axes.flatten()
 
-    # ── Plot 1: Loss trajectory ───────────────────────────────────────────────
-    axes[0].plot(E, history["train_loss"], label="Train Loss (Total)", color="blue")
-    axes[0].plot(E, history["val_loss"],   label="Val Loss (clean)",   color="red",        ls="--")
-    axes[0].plot(E, history["loss_clean"], label="L_clean",            color="steelblue",  ls=":")
-    axes[0].plot(E, history["loss_deg"],   label="L_deg",              color="darkorange", ls=":")
-    axes[0].plot(E, history["loss_aux"],   label="L_aux (bases)",      color="green",      ls=":")
-    axes[0].plot(E, history["loss_cons"],  label="L_cons",             color="purple",     ls=":")
-    if PHASE1_END < len(history["train_loss"]):
-        axes[0].axvline(x=PHASE1_END, color="gray", ls="--", alpha=0.6,
-                        label=f"Phase switch (ep {PHASE1_END})")
-    axes[0].set_title("Loss Trajectory (Phased Weights)")
-    axes[0].set_xlabel("Epoch"); axes[0].set_ylabel("Loss")
-    axes[0].legend(fontsize=7); axes[0].grid(True, ls=":", alpha=0.6)
+    ax[0].plot(E, H["tr_loss"], label="Train Loss",          color="blue")
+    ax[0].plot(E, H["vl_loss"], label="Val Loss (balanced)",  color="red",        ls="--")
+    ax[0].plot(E, H["l_clean"], label="L_clean",             color="steelblue",  ls=":")
+    ax[0].plot(E, H["l_deg"],   label="L_deg",               color="darkorange", ls=":")
+    ax[0].plot(E, H["l_aux"],   label="L_aux (bases)",       color="green",      ls=":")
+    ax[0].plot(E, H["l_cons"],  label="L_cons",              color="purple",     ls=":")
+    ax[0].set_title("Loss Trajectory"); ax[0].set_xlabel("Epoch")
+    ax[0].legend(fontsize=7); ax[0].grid(True, ls=":", alpha=0.6)
 
-    # ── Plot 2: EER ───────────────────────────────────────────────────────────
-    axes[1].plot(E, history["val_eer_clean"], label="EER_clean %", color="green")
-    axes[1].plot(E, history["val_eer_aug"],   label="EER_aug %",   color="purple", ls="--")
-    axes[1].plot(E, history["train_eer"],     label="Train EER %", color="teal",   ls=":")
-    if PHASE1_END < len(history["val_eer_clean"]):
-        axes[1].axvline(x=PHASE1_END, color="gray", ls="--", alpha=0.6)
-    axes[1].set_title("Equal Error Rate (↓ Better)")
-    axes[1].set_xlabel("Epoch"); axes[1].set_ylabel("EER (%)")
-    axes[1].legend(); axes[1].grid(True, ls=":", alpha=0.6)
+    ax[1].plot(E, H["vl_eer_c"], label="EER_clean % (balanced)", color="green")
+    ax[1].plot(E, H["vl_eer_a"], label="EER_aug %",               color="purple", ls="--")
+    ax[1].plot(E, H["tr_eer"],   label="Train EER %",             color="teal",   ls=":")
+    ax[1].set_title("Equal Error Rate — Balanced Val (↓ Better)")
+    ax[1].set_xlabel("Epoch"); ax[1].legend(); ax[1].grid(True, ls=":", alpha=0.6)
 
-    # ── Plot 3: Composite checkpoint metric ───────────────────────────────────
-    axes[2].plot(E, history["composite"], label="Composite score", color="navy")
-    if PHASE1_END < len(history["composite"]):
-        axes[2].axvline(x=PHASE1_END, color="gray", ls="--", alpha=0.6)
-    axes[2].set_title(
-        f"Checkpoint Metric (↓ Better)\n= {CKPT_CLEAN_W}·EER_c + {CKPT_AUG_W}·EER_a"
+    ax[2].plot(E, H["composite"], label="Composite score", color="navy")
+    ax[2].set_title(f"Checkpoint Metric (↓ Better)\n"
+                    f"= {CKPT_CLEAN_W}·EER_c + {CKPT_AUG_W}·EER_a")
+    ax[2].set_xlabel("Epoch"); ax[2].legend(); ax[2].grid(True, ls=":", alpha=0.6)
+
+    ax[3].plot(E, H["vl_auc"], label="ROC-AUC (balanced)", color="darkgreen")
+    ax[3].axhline(0.5, ls=":", color="gray", alpha=0.5, label="Random")
+    ax[3].set_ylim(0.4, 1.02)
+    ax[3].set_title("Validation AUC — Balanced Val (↑ Better)")
+    ax[3].set_xlabel("Epoch"); ax[3].legend(); ax[3].grid(True, ls=":", alpha=0.6)
+
+    ax[4].plot(E, H["vl_mdc"], label="minDCF", color="darkred")
+    ax[4].axhline(1., ls=":", color="gray", alpha=0.5, label="Chance")
+    ax[4].set_title("Validation minDCF — Balanced Val (↓ Better)")
+    ax[4].set_xlabel("Epoch"); ax[4].legend(); ax[4].grid(True, ls=":", alpha=0.6)
+
+    ax5b = ax[5].twinx()
+    ax[5].plot(E, H["alpha"], label="α (PD-controlled)", color="orange", lw=2)
+    ax[5].axhline(controller.alpha_max, ls=":", color="red",  alpha=0.5,
+                  label=f"α_max={controller.alpha_max}")
+    ax[5].axhline(controller.alpha_min, ls=":", color="gray", alpha=0.5,
+                  label=f"α_min={controller.alpha_min}")
+    ax5b.plot(E, H["vl_eer_a"], label="EER_aug %", color="purple", ls="--", alpha=0.5)
+    ax[5].set_title("UR-FFL Alpha Trajectory"); ax[5].set_xlabel("Epoch")
+    ax[5].set_ylabel("α", color="orange"); ax5b.set_ylabel("EER_aug (%)", color="purple")
+    ax[5].set_ylim(-0.05, 1.05)
+    l1, b1 = ax[5].get_legend_handles_labels()
+    l2, b2 = ax5b.get_legend_handles_labels()
+    ax[5].legend(l1 + l2, b1 + b2, fontsize=7); ax[5].grid(True, ls=":", alpha=0.6)
+
+    cfg_text = (
+        f"Mode: Cold-start, end-to-end\n"
+        f"PD: SP={controller.SETPOINT}pp, α_max={controller.alpha_max}\n"
+        f"Kp={controller.Kp}, Kd={controller.Kd}, step≤{controller.MAX_STEP}\n"
+        f"Loss: clean={CLEAN_W} deg={DEG_W} aux={AUX_W} cons={CONS_W}\n"
+        f"Ckpt: {CKPT_CLEAN_W}·EER_c + {CKPT_AUG_W}·EER_a\n"
+        f"FocalLoss: γ=2.0, ls=0.10\n"
+        f"LR_base={LR_BASE:.0e}, LR_fuser={LR_FUSER:.0e}\n"
+        f"SpecAugment: freq=15, time=25\n"
+        f"Best composite: {best_comp:.4f}%\n"
+        f"Best clean EER: {best_clean_eer:.4f}%"
     )
-    axes[2].set_xlabel("Epoch"); axes[2].set_ylabel("Composite EER (%)")
-    axes[2].legend(); axes[2].grid(True, ls=":", alpha=0.6)
-
-    # ── Plot 4: AUC ───────────────────────────────────────────────────────────
-    axes[3].plot(E, history["val_auc"], label="ROC-AUC", color="darkgreen")
-    axes[3].axhline(y=0.5, ls=":", color="gray", alpha=0.5, label="Random baseline")
-    axes[3].set_title("Validation AUC (↑ Better)")
-    axes[3].set_xlabel("Epoch"); axes[3].set_ylabel("AUC")
-    axes[3].set_ylim(0.4, 1.02)
-    axes[3].legend(); axes[3].grid(True, ls=":", alpha=0.6)
-
-    # ── Plot 5: minDCF ────────────────────────────────────────────────────────
-    axes[4].plot(E, history["val_min_dcf"], label="minDCF", color="darkred")
-    axes[4].axhline(y=1.0, ls=":", color="gray", alpha=0.5, label="Chance baseline")
-    axes[4].set_title("Validation minDCF (↓ Better)")
-    axes[4].set_xlabel("Epoch"); axes[4].set_ylabel("Normalised minDCF")
-    axes[4].legend(); axes[4].grid(True, ls=":", alpha=0.6)
-
-    # ── Plot 6: Alpha + phase weights ─────────────────────────────────────────
-    ax6  = axes[5]
-    ax6b = ax6.twinx()
-    ax6.plot(E, history["alpha"],   label="α (aug intensity)", color="orange",  lw=2)
-    ax6b.plot(E, history["clean_w"], label="clean_w+deg_w",    color="navy",    ls=":", lw=1.5,
-              alpha=0.7)
-    ax6b.plot(E, history["aux_w"],   label="aux_w",            color="darkcyan",ls=":", lw=1.5,
-              alpha=0.7)
-    ax6.axhline(y=controller.alpha_min, ls=":", color="gray",  alpha=0.5,
-                label=f"α_min={controller.alpha_min}")
-    ax6.axhline(y=controller.alpha_max, ls=":", color="red",   alpha=0.5,
-                label=f"α_max={controller.alpha_max}")
-    if PHASE1_END < len(history["alpha"]):
-        ax6.axvline(x=PHASE1_END, color="gray", ls="--", alpha=0.6,
-                    label=f"Phase switch (ep {PHASE1_END})")
-    ax6.set_title("UR-FFL Alpha + Phased Loss Weights")
-    ax6.set_xlabel("Epoch")
-    ax6.set_ylabel("α", color="orange")
-    ax6b.set_ylabel("Loss weight", color="navy")
-    ax6.set_ylim(0.0, 1.0); ax6b.set_ylim(0.0, 1.0)
-    lines1, labels1 = ax6.get_legend_handles_labels()
-    lines2, labels2 = ax6b.get_legend_handles_labels()
-    ax6.legend(lines1 + lines2, labels1 + labels2, fontsize=7, loc="upper right")
-    ax6.grid(True, ls=":", alpha=0.6)
+    fig.text(0.72, 0.08, cfg_text, fontsize=7.5, family="monospace",
+             bbox=dict(boxstyle="round", facecolor="lightyellow", alpha=0.8))
 
     fig.suptitle(
-        "UR-FFL Cross-Attention Ensemble — Cold-Start v3\n"
-        "(Phased Training + SpecAugment on Clean Branch + PD Phase Activation)",
+        "UR-FFL Cross-Attention Ensemble — Cold-Start v2\n"
+        "(Calibrated PD · fp32 · Corrected LR · Dual Checkpoint · SpecAugment)",
         fontsize=13,
     )
     fig.tight_layout()
     gp = os.path.join(RESULTS_DIR, "crossattention_ensemble_urffl_metrics.png")
     fig.savefig(gp, dpi=300, bbox_inches="tight")
     plt.close(fig)
-    print(f"Plots saved to {gp}")
+    print(f"Plots → {gp}")
 
 
 if __name__ == "__main__":

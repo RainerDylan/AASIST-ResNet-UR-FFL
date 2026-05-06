@@ -491,7 +491,7 @@ def main():
         plt.title(f'ROC Curve ({dataset_name} Evaluation)')
         plt.legend(loc="lower right")
         plt.grid(True, linestyle=':', alpha=0.6)
-        roc_path = os.path.join(RESULTS_DIR, f"eval_roc_curve_{dataset_name.lower()}.png")
+        roc_path = os.path.join(RESULTS_DIR, f"aasist_roc_curve_{dataset_name.lower()}.png")
         plt.savefig(roc_path, dpi=300, bbox_inches='tight')
         plt.close()
         
@@ -500,7 +500,7 @@ def main():
         display.plot(ax=ax)
         plt.title(f'DET Curve ({dataset_name} Evaluation)')
         plt.grid(True, linestyle=':', alpha=0.6)
-        det_path = os.path.join(RESULTS_DIR, f"eval_det_curve_{dataset_name.lower()}.png")
+        det_path = os.path.join(RESULTS_DIR, f"aasist_det_curve_{dataset_name.lower()}.png")
         plt.savefig(det_path, dpi=300, bbox_inches='tight')
         plt.close()
         
@@ -512,7 +512,7 @@ def main():
         plt.ylabel('Number of Audio Samples', fontsize=10)
         plt.legend(loc="upper center")
         plt.grid(True, linestyle=':', alpha=0.6)
-        dist_path = os.path.join(RESULTS_DIR, f"eval_score_dist_{dataset_name.lower()}.png")
+        dist_path = os.path.join(RESULTS_DIR, f"aasist_score_dist_{dataset_name.lower()}.png")
         plt.savefig(dist_path, dpi=300, bbox_inches='tight')
         plt.close()
 
@@ -522,7 +522,7 @@ def main():
         plt.title(f'Confusion Matrix ({dataset_name} Evaluation)', fontsize=12, pad=15)
         plt.xlabel('Predicted Classification', fontsize=10)
         plt.ylabel('True Ground Label', fontsize=10)
-        cm_path = os.path.join(RESULTS_DIR, f"eval_confusion_matrix_{dataset_name.lower()}.png")
+        cm_path = os.path.join(RESULTS_DIR, f"aasist_confusion_matrix_{dataset_name.lower()}.png")
         plt.savefig(cm_path, dpi=300, bbox_inches='tight')
         plt.close()
         
@@ -540,7 +540,7 @@ def main():
         plt.title(f'Detection Cost Function Curve ({dataset_name} Evaluation)')
         plt.legend(loc="upper center")
         plt.grid(True, linestyle=':', alpha=0.6)
-        dcf_path = os.path.join(RESULTS_DIR, f"eval_dcf_curve_{dataset_name.lower()}.png")
+        dcf_path = os.path.join(RESULTS_DIR, f"aasist_dcf_curve_{dataset_name.lower()}.png")
         plt.savefig(dcf_path, dpi=300, bbox_inches='tight')
         plt.close()
         
