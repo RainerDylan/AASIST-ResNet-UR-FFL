@@ -59,68 +59,92 @@ class MetaLearner(nn.Module):
         x = self.dropout(x)
         return self.fc2(x)
 
-class CrossAttentionFuser(nn.Module):
-    def __init__(self, dim_a=104, dim_r=512, embed_dim=256, num_heads=8, num_classes=2, dropout=0.3):
+# ── ARCHITECTURE SYNC ─────────────────────────────────────────────────────────
+
+class BackboneWrapper(nn.Module):
+    def __init__(self, backbone: nn.Module, fc_attr: str = "fc"):
         super().__init__()
-        self.proj_a = nn.Sequential(nn.Linear(dim_a, embed_dim), nn.LayerNorm(embed_dim))
-        self.proj_r = nn.Sequential(nn.Linear(dim_r, embed_dim), nn.LayerNorm(embed_dim))
-        
+        self.backbone = backbone
+        self._emb     = None
+        fc = getattr(backbone, fc_attr, None)
+        self._handle = fc.register_forward_hook(self._capture)
+
+    def _capture(self, module, inp, out):
+        self._emb = inp[0]
+
+    def forward(self, x):
+        self._emb = None
+        logit     = self.backbone(x.float())
+        emb       = self._emb
+        self._emb = None
+        return logit, emb
+
+class CrossAttentionFuser(nn.Module):
+    def __init__(self, dim_a=104, dim_r=512, embed_dim=256, num_heads=8, num_classes=2, dropout=0.30):
+        super().__init__()
+        self.proj_a    = nn.Sequential(nn.Linear(dim_a, embed_dim), nn.LayerNorm(embed_dim))
+        self.proj_r    = nn.Sequential(nn.Linear(dim_r, embed_dim), nn.LayerNorm(embed_dim))
         self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
-        nn.init.normal_(self.cls_token, std=0.02)
+        self.pos_emb   = nn.Parameter(torch.zeros(1, 3, embed_dim)) # SYNC: Added pos_emb
         
-        # FIX: Added dim_feedforward=1024 to match training script
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=embed_dim, 
-            nhead=num_heads, 
-            dim_feedforward=1024, 
-            dropout=dropout, 
-            batch_first=True
+        enc = nn.TransformerEncoderLayer(
+            d_model=embed_dim, nhead=num_heads,
+            dim_feedforward=embed_dim * 4, dropout=dropout,
+            batch_first=True, norm_first=True,
         )
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=2)
+        self.transformer = nn.TransformerEncoder(enc, num_layers=2)
         
-        # FIX: Renamed 'fc' to 'head' to match training script
+        # SYNC: Added LayerNorm at index 0
         self.head = nn.Sequential(
+            nn.LayerNorm(embed_dim),
             nn.Linear(embed_dim, embed_dim),
             nn.ReLU(),
             nn.Dropout(dropout),
-            nn.Linear(embed_dim, num_classes)
+            nn.Linear(embed_dim, num_classes),
         )
 
-    def forward(self, emb_a, emb_r):
-        if emb_a.dtype != emb_r.dtype: emb_a = emb_a.to(emb_r.dtype)
-        B = emb_a.size(0)
-        feat_a = self.proj_a(emb_a).unsqueeze(1) 
-        feat_r = self.proj_r(emb_r).unsqueeze(1) 
-        cls_tokens = self.cls_token.expand(B, -1, -1) 
-        x = torch.cat((cls_tokens, feat_a, feat_r), dim=1) 
-        x = self.transformer(x)
-        # Output uses self.head
-        return self.head(x[:, 0, :])
+    def forward(self, ea, er):
+        ea = ea.float(); er = er.float()
+        B  = ea.size(0)
+        seq = torch.cat([
+            self.cls_token.expand(B, -1, -1),
+            self.proj_a(ea).unsqueeze(1),
+            self.proj_r(er).unsqueeze(1),
+        ], dim=1) + self.pos_emb
+        return self.head(self.transformer(seq)[:, 0, :])
 
 class EndToEndEnsemble(nn.Module):
-    def __init__(self, aasist, resnet, fusion_head):
-        super(EndToEndEnsemble, self).__init__()
-        self.aasist = aasist
-        self.resnet = resnet
-        self.fusion_head = fusion_head
-        self.emb_a = [None]
-        self.emb_r = [None]
-
-        def hook_a(module, inp, out): self.emb_a[0] = inp[0]
-        def hook_r(module, inp, out): self.emb_r[0] = inp[0]
-
-        self.h_a = self.aasist.fc.register_forward_hook(hook_a)
-        self.h_r = self.resnet.fc.register_forward_hook(hook_r)
-
-    def forward(self, waveform, mel_db, return_base_outs=False):
-        out_a = self.aasist(waveform)
-        with torch.amp.autocast('cuda'):
-            out_r = self.resnet(mel_db)
-            out_meta = self.fusion_head(self.emb_a[0], self.emb_r[0])
+    def __init__(self, aasist, resnet, fuser, is_cross_attention=True):
+        super().__init__()
+        self.is_cross_attention = is_cross_attention
+        if self.is_cross_attention:
+            # SYNC: Use BackboneWrapper for CrossAttention architecture
+            self.aasist_w = BackboneWrapper(aasist, fc_attr="fc")
+            self.resnet_w = BackboneWrapper(resnet, fc_attr="fc")
+        else:
+            self.aasist = aasist
+            self.resnet = resnet
+            self.emb_a = [None]
+            self.emb_r = [None]
+            def hook_a(m, i, o): self.emb_a[0] = i[0]
+            def hook_r(m, i, o): self.emb_r[0] = i[0]
+            self.aasist.fc.register_forward_hook(hook_a)
+            self.resnet.fc.register_forward_hook(hook_r)
             
-        if return_base_outs:
-            return out_meta, out_a, out_r
-        return out_meta
+        self.fusion_head = fuser
+
+    def forward(self, wav, mel):
+        if self.is_cross_attention:
+            _, ea = self.aasist_w(wav.float())
+            _, er = self.resnet_w(mel.float())
+            return self.fusion_head(ea, er)
+        else:
+            _ = self.aasist(wav)
+            with torch.amp.autocast('cuda'):
+                _ = self.resnet(mel)
+                return self.fusion_head(self.emb_a[0], self.emb_r[0])
+
+# ──────────────────────────────────────────────────────────────────────────────
 
 def compute_min_dcf(fpr, fnr, p_target=0.05, c_miss=1.0, c_fa=1.0):
     dcf = c_miss * fnr * p_target + c_fa * fpr * (1.0 - p_target)
@@ -242,18 +266,15 @@ def load_ensemble(device, selected_weights_path):
         print("-> Detected Standard MLP Meta-Learner head.")
         fusion_head = MetaLearner(input_dim=616).to(device)
     
-    wrapper = EndToEndEnsemble(aasist_model, resnet_model, fusion_head).to(device)
+    wrapper = EndToEndEnsemble(aasist_model, resnet_model, fusion_head, is_cross_attention).to(device)
     
-    # Load the saved file (either raw weights or a full checkpoint dictionary)
     checkpoint = torch.load(selected_weights_path, map_location=device)
     
-    # Safely extract the raw weights if it's a full UR-FFL checkpoint dictionary
     if 'model_state_dict' in checkpoint:
         state_dict = checkpoint['model_state_dict']
     else:
         state_dict = checkpoint
 
-    # Apply the weights to the model
     if not is_cross_attention:
         new_state_dict = {}
         for k, v in state_dict.items():
@@ -346,8 +367,6 @@ def main():
     all_labels = []
     all_probs = []
     all_preds = []
-    correct_predictions = 0
-    total_samples = 0
     
     with torch.no_grad():
         for waveforms, labels in tqdm(eval_loader, desc="Evaluating Benchmarks"):
@@ -362,9 +381,6 @@ def main():
             probs = torch.softmax(outputs, dim=1)[:, 1]
             _, predicted_classes = torch.max(outputs.data, 1)
             
-            total_samples += labels.size(0)
-            correct_predictions += (predicted_classes == labels).sum().item()
-            
             all_labels.extend(labels.cpu().numpy())
             all_probs.extend(probs.cpu().numpy())
             all_preds.extend(predicted_classes.cpu().numpy())
@@ -373,15 +389,20 @@ def main():
     all_probs = np.array(all_probs)
     all_preds = np.array(all_preds)
     
+    total_samples = len(all_labels)
+    correct_predictions = (all_preds == all_labels).sum()
     accuracy = (correct_predictions / total_samples) * 100
+    
     fpr, tpr, thresholds = roc_curve(all_labels, all_probs, pos_label=1)
     fnr = 1 - tpr
     auc_score = auc(fpr, tpr)
     
     eer_idx = np.nanargmin(np.absolute((fnr - fpr)))
     eer = fpr[eer_idx] * 100
+    eer_threshold = thresholds[eer_idx]
     
     min_dcf_norm, dcf_curve, default_dcf, min_dcf_idx = compute_min_dcf(fpr, fnr)
+    dcf_threshold = thresholds[min_dcf_idx]
     
     cm = confusion_matrix(all_labels, all_preds)
     tn, fp, fn, tp = cm.ravel()
@@ -395,15 +416,21 @@ def main():
     print("\n========================================")
     print("AI DIAGNOSTIC REPORT")
     print("========================================")
-    print("--- CONFUSION MATRIX ---")
+    print("--- CONFUSION MATRIX (At Default 0.5 Threshold) ---")
     print(f"True Positives (Correct Spoof):  {tp}")
     print(f"True Negatives (Correct Bonafide): {tn}")
     print(f"False Positives (False Spoof):   {fp}")
     print(f"False Negatives (Missed Spoof):  {fn}")
     print(f"Precision: {precision:.4f} | Recall: {recall:.4f} | F1-Score: {f1:.4f}")
     
-    print("\n--- DETECTION COST FUNCTION (DCF) ---")
-    print(f"Min Normalized DCF: {min_dcf_norm:.4f} at Decision Threshold: {thresholds[min_dcf_idx]:.4f}")
+    print("\n--- PERFORMANCE THRESHOLDS ---")
+    print(f"Equal Error Rate (EER) Threshold: {eer_threshold:.4f}")
+    print(f"Min DCF Threshold:                {dcf_threshold:.4f}")
+    
+    print("\n--- SCORE DISTRIBUTIONS ---")
+    print(f"Mean Bonafide Score: {bonafide_scores.mean():.4f} (std: {bonafide_scores.std():.4f})")
+    print(f"Mean Deepfake Score: {deepfake_scores.mean():.4f} (std: {deepfake_scores.std():.4f})")
+    print(f"Separation Margin:   {abs(bonafide_scores.mean() - deepfake_scores.mean()):.4f}")
     
     print("\n========================================")
     print("FINAL EVALUATION METRICS")
@@ -412,8 +439,11 @@ def main():
     print(f"Equal Error Rate (EER): {eer:.4f}%")
     print(f"Area Under the Curve (AUC): {auc_score:.4f}")
     print(f"Normalized Minimum DCF (t-DCF Proxy): {min_dcf_norm:.4f}")
-    print("========================================")
+    print("========================================\n")
     
+    # ── PLOTTING ─────────────────────────────────────────────────────────────────
+    
+    # 1. ROC Curve
     plt.figure(figsize=(8, 6))
     plt.plot(fpr, tpr, color='darkorange', lw=2, label=f'ROC curve (AUC = {auc_score:.4f})')
     plt.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--')
@@ -424,19 +454,43 @@ def main():
     plt.title(f'ROC Curve ({dataset_name} Evaluation)')
     plt.legend(loc="lower right")
     plt.grid(True, linestyle=':', alpha=0.6)
-    roc_path = os.path.join(RESULTS_DIR, f"meta_roc_curve_{dataset_name.lower()}.png")
+    roc_path = os.path.join(RESULTS_DIR, f"eval_roc_curve_{dataset_name.lower()}.png")
     plt.savefig(roc_path, dpi=300, bbox_inches='tight')
     plt.close()
     
+    # 2. Confusion Matrix
     fig, ax = plt.subplots(figsize=(7, 6))
     cm_display = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=['Deepfake', 'Bonafide'])
     cm_display.plot(cmap=plt.cm.Blues, ax=ax, values_format='d')
     plt.title(f'Confusion Matrix ({dataset_name})', fontsize=12, pad=15)
-    cm_path = os.path.join(RESULTS_DIR, f"meta_confusion_matrix_{dataset_name.lower()}.png")
+    cm_path = os.path.join(RESULTS_DIR, f"eval_confusion_matrix_{dataset_name.lower()}.png")
     plt.savefig(cm_path, dpi=300, bbox_inches='tight')
     plt.close()
     
-    print(f"Graphics successfully generated and saved to {RESULTS_DIR}")
+    # 3. Score Distribution Histogram (New)
+    plt.figure(figsize=(10, 6))
+    plt.hist(bonafide_scores, bins=50, alpha=0.6, color='blue', density=True, label='Bonafide (Genuine)')
+    plt.hist(deepfake_scores, bins=50, alpha=0.6, color='red', density=True, label='Spoof (Deepfake)')
+    plt.axvline(eer_threshold, color='black', linestyle='dashed', linewidth=2, label=f'EER Threshold ({eer_threshold:.2f})')
+    plt.title(f'Model Confidence Score Distribution ({dataset_name})')
+    plt.xlabel('Predicted Probability of being Bonafide')
+    plt.ylabel('Density')
+    plt.legend(loc='upper center')
+    plt.grid(True, linestyle=':', alpha=0.6)
+    dist_path = os.path.join(RESULTS_DIR, f"eval_score_distribution_{dataset_name.lower()}.png")
+    plt.savefig(dist_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    
+    # 4. DET Curve (New)
+    fig, ax = plt.subplots(figsize=(8, 8))
+    DetCurveDisplay(fpr=fpr, fnr=fnr, estimator_name=f"Ensemble (EER={eer:.2f}%)").plot(ax=ax)
+    plt.title(f'Detection Error Tradeoff (DET) Curve - {dataset_name}')
+    plt.grid(True, linestyle=':', alpha=0.6)
+    det_path = os.path.join(RESULTS_DIR, f"eval_det_curve_{dataset_name.lower()}.png")
+    plt.savefig(det_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    
+    print(f"Successfully generated and saved 4 Diagnostic Graphics to {RESULTS_DIR}")
 
 if __name__ == "__main__":
     main()
