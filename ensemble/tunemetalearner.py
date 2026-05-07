@@ -36,7 +36,8 @@ AASIST_WEIGHTS = os.path.join(MODELS_DIR, "aasist_unified_best.pth")
 RESNET_WEIGHTS = os.path.join(MODELS_DIR, "resnet_unified_best.pth")
 
 class MetaLearner(nn.Module):
-    def __init__(self, input_dim=616, hidden_dim=256, num_classes=2, dropout=0.3):
+    # UPDATED: input_dim changed to 563 (51 AASIST + 512 ResNet)
+    def __init__(self, input_dim=563, hidden_dim=256, num_classes=2, dropout=0.3):
         super(MetaLearner, self).__init__()
         self.fc1 = nn.Linear(input_dim, hidden_dim)
         self.bn1 = nn.BatchNorm1d(hidden_dim)
@@ -101,16 +102,22 @@ def objective(trial):
     
     print(f"\n[Trial {trial.number}] LR: {lr:.2e} | Hidden: {hidden_dim} | Dropout: {dropout:.2f} | WD: {weight_decay:.2e}")
 
-    # Use the unified dimensions you found for the base models
-    aasist_model = AASIST(stft_window=698, stft_hop=398, freq_bins=116, gat_layers=2, heads=5, head_dim=104, hidden_dim=455, dropout=0.33)
-    resnet_model = resnet18_simam(num_classes=2, dropout_rate=0.22)
+    # UPDATED: Using the exact optimal AASIST parameters
+    aasist_model = AASIST(
+        stft_window=978, stft_hop=465, freq_bins=179, 
+        gat_layers=4, heads=2, head_dim=51, 
+        hidden_dim=84, dropout=0.23013213230530574
+    )
+    # UPDATED: Using the exact optimal ResNet parameters
+    resnet_model = resnet18_simam(num_classes=2, dropout_rate=0.1798695128633439)
     
     ckpt_a = torch.load(AASIST_WEIGHTS, map_location=device)
     aasist_model.load_state_dict(ckpt_a['model_state_dict'] if 'model_state_dict' in ckpt_a else ckpt_a)
     ckpt_r = torch.load(RESNET_WEIGHTS, map_location=device)
     resnet_model.load_state_dict(ckpt_r['model_state_dict'] if 'model_state_dict' in ckpt_r else ckpt_r)
     
-    fusion_head = MetaLearner(input_dim=616, hidden_dim=hidden_dim, num_classes=2, dropout=dropout)
+    # UPDATED: input_dim 563 to match base model concatenation
+    fusion_head = MetaLearner(input_dim=563, hidden_dim=hidden_dim, num_classes=2, dropout=dropout)
     wrapper_model = EndToEndEnsemble(aasist_model, resnet_model, fusion_head).to(device)
     
     # Freeze Base Models for Fusion Tuning
@@ -127,8 +134,8 @@ def objective(trial):
     optimizer = optim.AdamW(wrapper_model.fusion_head.parameters(), lr=lr, weight_decay=weight_decay)
     criterion = nn.CrossEntropyLoss()
     
-    # These must match the ResNet base model's training configuration exactly
-    mel_transform = T.MelSpectrogram(sample_rate=16000, n_fft=512, hop_length=160, n_mels=80).to(device)
+    # UPDATED: Using the exact optimal ResNet frontend parameters
+    mel_transform = T.MelSpectrogram(sample_rate=16000, n_fft=512, hop_length=128, n_mels=128).to(device)
     amp_to_db = T.AmplitudeToDB(stype="power", top_db=80).to(device)
     scaler = torch.amp.GradScaler("cuda")
     

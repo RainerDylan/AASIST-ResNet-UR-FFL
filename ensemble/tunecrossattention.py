@@ -36,7 +36,8 @@ AASIST_WEIGHTS = os.path.join(MODELS_DIR, "aasist_unified_best.pth")
 RESNET_WEIGHTS = os.path.join(MODELS_DIR, "resnet_unified_best.pth")
 
 class CrossAttentionFuser(nn.Module):
-    def __init__(self, dim_a=104, dim_r=512, embed_dim=256, num_heads=8, num_classes=2, dropout=0.3):
+    # UPDATED: dim_a changed to 51 to match the new AASIST head_dim
+    def __init__(self, dim_a=51, dim_r=512, embed_dim=256, num_heads=8, num_classes=2, dropout=0.3):
         super().__init__()
         self.proj_a = nn.Sequential(nn.Linear(dim_a, embed_dim), nn.LayerNorm(embed_dim))
         self.proj_r = nn.Sequential(nn.Linear(dim_r, embed_dim), nn.LayerNorm(embed_dim))
@@ -112,16 +113,22 @@ def objective(trial):
     
     print(f"\n[Trial {trial.number}] LR: {lr:.2e} | Embed: {embed_dim} | Heads: {num_heads} | Drop: {dropout:.2f} | WD: {weight_decay:.2e}")
 
-    # Use the unified dimensions you found
-    aasist_model = AASIST(stft_window=698, stft_hop=398, freq_bins=116, gat_layers=2, heads=5, head_dim=104, hidden_dim=455, dropout=0.33)
-    resnet_model = resnet18_simam(num_classes=2, dropout_rate=0.22)
+    # UPDATED: Using the exact optimal AASIST parameters
+    aasist_model = AASIST(
+        stft_window=978, stft_hop=465, freq_bins=179, 
+        gat_layers=4, heads=2, head_dim=51, 
+        hidden_dim=84, dropout=0.23013213230530574
+    )
+    # UPDATED: Using the exact optimal ResNet parameters
+    resnet_model = resnet18_simam(num_classes=2, dropout_rate=0.1798695128633439)
     
     ckpt_a = torch.load(AASIST_WEIGHTS, map_location=device)
     aasist_model.load_state_dict(ckpt_a['model_state_dict'] if 'model_state_dict' in ckpt_a else ckpt_a)
     ckpt_r = torch.load(RESNET_WEIGHTS, map_location=device)
     resnet_model.load_state_dict(ckpt_r['model_state_dict'] if 'model_state_dict' in ckpt_r else ckpt_r)
     
-    fusion_head = CrossAttentionFuser(dim_a=104, dim_r=512, embed_dim=embed_dim, num_heads=num_heads, num_classes=2, dropout=dropout)
+    # UPDATED: dim_a matches new AASIST head_dim=51
+    fusion_head = CrossAttentionFuser(dim_a=51, dim_r=512, embed_dim=embed_dim, num_heads=num_heads, num_classes=2, dropout=dropout)
     wrapper_model = EndToEndEnsemble(aasist_model, resnet_model, fusion_head).to(device)
     
     # Freeze Base Models for Fusion Tuning
@@ -138,8 +145,8 @@ def objective(trial):
     optimizer = optim.AdamW(wrapper_model.fusion_head.parameters(), lr=lr, weight_decay=weight_decay)
     criterion = nn.CrossEntropyLoss()
     
-    # These must match the ResNet base model's training configuration exactly
-    mel_transform = T.MelSpectrogram(sample_rate=16000, n_fft=512, hop_length=160, n_mels=80).to(device)
+    # UPDATED: Using the exact optimal ResNet frontend parameters
+    mel_transform = T.MelSpectrogram(sample_rate=16000, n_fft=512, hop_length=128, n_mels=128).to(device)
     amp_to_db = T.AmplitudeToDB(stype="power", top_db=80).to(device)
     scaler = torch.amp.GradScaler("cuda")
     
